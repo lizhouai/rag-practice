@@ -1,0 +1,5 @@
+# Zhipu embedding-3 is called through the OpenAI-compatible embeddings API.
+openai>=2.0.0
+
+# DeepSeek's Anthropic-compatible Messages API is called with Python stdlib urllib.
+# No extra anthropic SDK dependency is required for this mini project.
