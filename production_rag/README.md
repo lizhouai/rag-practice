@@ -21,6 +21,22 @@
 - 引用校验；
 - trace 和 monitoring event。
 
+## 运行模式总览
+
+这个项目按用途分成两种模式：
+
+| 模式 | 推荐用途 | 命令形态 | 使用的模型与存储 |
+| --- | --- | --- | --- |
+| 真实模型模式 | 主学习路径，观察真实 embedding、真实生成模型和 Qdrant 如何协同 | `python run_pipeline.py --query "你的问题" --real-models --rebuild-index` | 真实 embedding provider + 真实 LLM + Qdrant |
+| 本地兜底模式 | 临时排障，验证非模型链路是否跑通 | `python run_pipeline.py --query "你的问题" --vector-backend local --rebuild-index` | 本地 hash embedding + 抽取式答案 + SQLite |
+
+推荐先跑真实模型模式。本地兜底模式只在 API Key、网络或 Qdrant 暂时不可用时使用，不用它评估真实召回质量、真实生成质量或最终用户体验。
+
+代码里有两个开关，但文档里建议只按上面两种稳定组合理解：
+
+- `--real-models`：是否使用配置好的真实 embedding 和真实 LLM。
+- `--vector-backend`：向量存储走 `qdrant` 还是 `local`。
+
 配套代码在本目录下：
 
 - `run_pipeline.py`：完整 Production RAG starter。
