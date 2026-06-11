@@ -332,7 +332,7 @@ class QdrantVectorStoreTest(unittest.TestCase):
 
 
 class ProviderClientTest(unittest.TestCase):
-    def test_deepseek_anthropic_client_posts_messages_request(self) -> None:
+    def test_anthropic_messages_client_posts_messages_request(self) -> None:
         captured: dict[str, object] = {}
 
         class FakeResponse:
@@ -352,7 +352,7 @@ class ProviderClientTest(unittest.TestCase):
             captured["timeout"] = timeout
             return FakeResponse()
 
-        client = rag.DeepSeekAnthropicClient(
+        client = rag.AnthropicMessagesClient(
             api_key="test-key",
             base_url="https://api.deepseek.com/anthropic",
         )
@@ -374,7 +374,7 @@ class ProviderClientTest(unittest.TestCase):
             "deepseek-v4-pro",
         )
 
-    def test_zhipu_embedding_client_posts_embedding_3_request(self) -> None:
+    def test_openai_compatible_embedding_client_posts_embedding_request(self) -> None:
         captured: dict[str, object] = {}
 
         class FakeResponse:
@@ -394,7 +394,7 @@ class ProviderClientTest(unittest.TestCase):
             captured["timeout"] = timeout
             return FakeResponse()
 
-        client = rag.ZhipuEmbeddingClient(
+        client = rag.OpenAICompatibleEmbeddingClient(
             api_key="zhipu-key",
             base_url="https://open.bigmodel.cn/api/paas/v4",
         )

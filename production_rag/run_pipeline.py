@@ -114,7 +114,7 @@ class Candidate:
 
 
 @dataclass
-class DeepSeekAnthropicClient:
+class AnthropicMessagesClient:
     api_key: str
     base_url: str
 
@@ -148,7 +148,7 @@ class DeepSeekAnthropicClient:
 
 
 @dataclass
-class ZhipuEmbeddingClient:
+class OpenAICompatibleEmbeddingClient:
     api_key: str
     base_url: str
 
@@ -1387,15 +1387,16 @@ def extract_citation_ids(text: str) -> list[str]:
     return sorted(set(re.findall(r"\[(E\d+)\]", text)))
 
 
-def generate_answer_with_deepseek(context_packet: dict) -> dict:
+def generate_answer_with_llm(context_packet: dict) -> dict:
     if not context_packet["sufficiency"]["enough"]:
         return generate_answer(context_packet)
     api_key = env_first("LLM_API_KEY", "ANTHROPIC_API_KEY", "DEEPSEEK_API_KEY")
     if not api_key:
-        raise RuntimeError("Missing DeepSeek API key. Set LLM_API_KEY, ANTHROPIC_API_KEY, or DEEPSEEK_API_KEY.")
-    client = DeepSeekAnthropicClient(api_key=api_key, base_url=resolve_llm_base_url())
+        raise RuntimeError("Missing LLM API key. Set LLM_API_KEY, ANTHROPIC_API_KEY, or DEEPSEEK_API_KEY.")
+    model_name = env_first("LLM_MODEL", default=DEFAULT_CHAT_MODEL) or DEFAULT_CHAT_MODEL
+    client = AnthropicMessagesClient(api_key=api_key, base_url=resolve_llm_base_url())
     answer_text = client.create_message(
-        model=env_first("LLM_MODEL", default=DEFAULT_CHAT_MODEL) or DEFAULT_CHAT_MODEL,
+        model=model_name,
         system_prompt="你是严谨的企业知识库 RAG 问答助手，只能基于给定证据回答，并且必须保留引用编号。",
         prompt=build_prompt_from_context_packet(context_packet),
         max_tokens=parse_int_env("LLM_MAX_TOKENS", DEFAULT_LLM_MAX_TOKENS),
@@ -1403,15 +1404,15 @@ def generate_answer_with_deepseek(context_packet: dict) -> dict:
     return {
         "answer": answer_text,
         "citations": extract_citation_ids(answer_text),
-        "mode": "deepseek_v4_pro",
+        "mode": f"llm:{model_name}",
     }
 
 
-def make_zhipu_embedder(dimensions: int | None = None):
+def make_embedding_function(dimensions: int | None = None):
     api_key = env_first("EMBEDDING_API_KEY", "ZHIPU_API_KEY")
     if not api_key:
-        raise RuntimeError("Missing Zhipu API key. Set EMBEDDING_API_KEY or ZHIPU_API_KEY.")
-    client = ZhipuEmbeddingClient(api_key=api_key, base_url=resolve_embedding_base_url())
+        raise RuntimeError("Missing embedding API key. Set EMBEDDING_API_KEY or ZHIPU_API_KEY.")
+    client = OpenAICompatibleEmbeddingClient(api_key=api_key, base_url=resolve_embedding_base_url())
     embedding_dimensions = dimensions or parse_int_env("EMBEDDING_DIMENSIONS", DEFAULT_EMBEDDING_DIMENSIONS)
 
     def embed(texts: list[str]) -> list[list[float]]:
@@ -1513,7 +1514,7 @@ def run_query(
 ) -> dict:
     started = time.perf_counter()
     scopes = allowed_scopes or DEFAULT_ALLOWED_SCOPES
-    embedder = make_zhipu_embedder() if real_models else None
+    embedder = make_embedding_function() if real_models else None
     embedding_model = (
         env_first("EMBEDDING_MODEL", default=DEFAULT_EMBEDDING_MODEL)
         if real_models
@@ -1558,7 +1559,7 @@ def run_query(
         permission_blocked_matches=permission_blocked_matches,
     )
     context_packet = assemble_context(query, selected, chunks_by_id, sufficiency)
-    answer = generate_answer_with_deepseek(context_packet) if real_models else generate_answer(context_packet)
+    answer = generate_answer_with_llm(context_packet) if real_models else generate_answer(context_packet)
     validation = validate_citations(answer, context_packet)
 
     trace = {
@@ -1697,7 +1698,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--real-models",
         action="store_true",
-        help="Use DeepSeek V4 Pro for generation and Zhipu embedding-3 for embeddings. Requires API keys.",
+        help="Use the configured LLM and embedding providers. Requires API keys.",
     )
     parser.add_argument(
         "--vector-backend",
