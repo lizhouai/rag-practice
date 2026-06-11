@@ -160,6 +160,97 @@ class IncrementalSyncTest(unittest.TestCase):
             self.assertTrue(all(chunk.dense_vector for chunk in stored_chunks))
 
 
+class RetrievalPipelineEnhancementTest(unittest.TestCase):
+    def test_external_reranker_can_replace_rule_score_ordering(self) -> None:
+        first = make_chunk("first", "internal")
+        first.text = "generic refund text"
+        second = make_chunk("second", "internal")
+        second.text = "exact SKU-A17 no reason return policy"
+        candidates = {
+            "first": rag.Candidate(chunk_id="first", rrf_score=0.2, dense_rank=1),
+            "second": rag.Candidate(chunk_id="second", rrf_score=0.1, bm25_rank=1),
+        }
+        chunks_by_id = {"first": first, "second": second}
+        captured: dict[str, object] = {}
+
+        class FakeResponse:
+            def __enter__(self) -> "FakeResponse":
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return b'{"results":[{"index":0,"score":0.2},{"index":1,"score":0.95}]}'
+
+        def fake_urlopen(request: urllib.request.Request, timeout: int) -> FakeResponse:
+            captured["url"] = request.full_url
+            captured["body"] = request.data
+            captured["timeout"] = timeout
+            return FakeResponse()
+
+        with patch("urllib.request.urlopen", fake_urlopen):
+            external = rag.make_external_reranker("http://reranker.test/rerank", model="bge-reranker-v2-m3")
+            ranked = rag.rerank("SKU-A17 是否支持无理由退货？", candidates, chunks_by_id, external_reranker=external)
+
+        request_body = json.loads(captured["body"].decode("utf-8"))
+        self.assertEqual(captured["url"], "http://reranker.test/rerank")
+        self.assertEqual(captured["timeout"], 30)
+        self.assertEqual(request_body["model"], "bge-reranker-v2-m3")
+        self.assertEqual(request_body["documents"][1]["id"], "second")
+        self.assertEqual([item.chunk_id for item in ranked], ["second", "first"])
+        self.assertEqual(ranked[0].reason, "external_reranker:bge-reranker-v2-m3")
+
+    def test_mmr_select_keeps_diverse_candidate_over_near_duplicate(self) -> None:
+        primary = make_chunk("primary", "internal")
+        primary.dense_vector = [1.0, 0.0]
+        duplicate = make_chunk("duplicate", "internal")
+        duplicate.dense_vector = [0.99, 0.01]
+        diverse = make_chunk("diverse", "internal")
+        diverse.dense_vector = [0.0, 1.0]
+        ranked = [
+            rag.Candidate(chunk_id="primary", rerank_score=0.9),
+            rag.Candidate(chunk_id="duplicate", rerank_score=0.85),
+            rag.Candidate(chunk_id="diverse", rerank_score=0.7),
+        ]
+
+        selected, dropped = rag.mmr_select(
+            ranked,
+            {"primary": primary, "duplicate": duplicate, "diverse": diverse},
+            limit=2,
+            lambda_mult=0.65,
+        )
+
+        self.assertEqual([item.chunk_id for item in selected], ["primary", "diverse"])
+        self.assertEqual(dropped[0]["chunk_id"], "duplicate")
+        self.assertEqual(dropped[0]["reason"], "near_duplicate")
+
+    def test_assemble_context_expands_selected_chunk_to_parent_siblings(self) -> None:
+        first = make_chunk("doc:sec_00:chunk_00", "internal")
+        first.parent_id = "doc:sec_00"
+        first.doc_id = "doc"
+        first.text = "第一段说明用户需要先核对订单。"
+        second = make_chunk("doc:sec_00:chunk_01", "internal")
+        second.parent_id = "doc:sec_00"
+        second.doc_id = "doc"
+        second.text = "第二段说明超过 15 个工作日要提交渠道核查。"
+        candidate = rag.Candidate(chunk_id=second.chunk_id, rerank_score=0.8)
+
+        packet = rag.assemble_context(
+            "跨境订单退款超时怎么办？",
+            [candidate],
+            {first.chunk_id: first, second.chunk_id: second},
+            {"enough": True, "reason": "pass"},
+            chunks_by_parent={"doc:sec_00": [first, second]},
+        )
+
+        evidence = packet["evidence"][0]
+        self.assertIn("第一段说明", evidence["text"])
+        self.assertIn("第二段说明", evidence["text"])
+        self.assertEqual(evidence["expanded_from_chunk_ids"], [first.chunk_id, second.chunk_id])
+        self.assertGreater(packet["estimated_token_total"], second.token_count)
+
+
 class QdrantVectorStoreTest(unittest.TestCase):
     def test_qdrant_cloud_url_without_rest_port_gets_actionable_error(self) -> None:
         message = rag.format_transport_error(
@@ -439,6 +530,16 @@ class CitationAndMonitoringTest(unittest.TestCase):
             "rerank_top": [1, 2, 3],
             "dedup_dropped": [{"chunk_id": "dup"}],
             "truncation": {"selected_count": 1, "token_total": 120},
+            "stage_latencies_ms": {
+                "index_sync": 7,
+                "dense_recall": 11,
+                "bm25_recall": 3,
+                "rerank": 13,
+                "mmr": 2,
+                "answer": 17,
+            },
+            "selection_strategy": {"name": "mmr", "lambda": 0.72, "parent_expansion": True},
+            "reranker": {"mode": "rule", "fallback_used": False},
         }
 
         event = rag.build_monitoring_event(trace, latency_ms=123, status="ok")
@@ -455,6 +556,20 @@ class CitationAndMonitoringTest(unittest.TestCase):
         self.assertEqual(event["dense_hits"], 2)
         self.assertEqual(event["bm25_hits"], 1)
         self.assertEqual(event["dedup_dropped_count"], 1)
+        self.assertEqual(event["stage_latencies_ms"]["rerank"], 13)
+        self.assertEqual(event["selection_strategy"], "mmr")
+        self.assertEqual(event["reranker_mode"], "rule")
+        self.assertEqual(event["reranker_fallback_used"], False)
+
+    def test_eval_cases_cover_starter_retrieval_and_permission_scenarios(self) -> None:
+        rows = list(rag.csv.DictReader(rag.EVAL_PATH.read_text(encoding="utf-8").splitlines()))
+        case_ids = {row["case_id"] for row in rows}
+
+        self.assertGreaterEqual(len(rows), 10)
+        self.assertIn("case_007", case_ids)
+        self.assertIn("case_008", case_ids)
+        self.assertIn("case_009", case_ids)
+        self.assertIn("case_010", case_ids)
 
     def test_run_query_appends_monitoring_event_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

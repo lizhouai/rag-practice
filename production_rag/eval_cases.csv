@@ -5,3 +5,7 @@ case_003,预售商品可以按 48 小时规则催单吗？,shipping_policy_v2,tr
 case_004,会员积分可以提现吗？,member_policy_v1,true,不能提现
 case_005,今天北京天气怎么样？,,false,资料不足
 case_006,公开客服规则里在线客服多久首次响应？,public_service_basics_v1,true,2 小时内首次响应
+case_007,电子发票没有收到怎么办？,zh_invoice_tax_cases,true,确认订单是否已完成
+case_008,维修点拒保时用户需要提供什么材料？,zh_warranty_repair_cases,true,检测单
+case_009,收到召回通知后客服要先核对什么？,zh_product_recall_cases,true,召回批次
+case_010,买家问商家取消订单能披露商家处罚分吗？,zh_marketplace_seller_cases,true,不能向买家披露商家的处罚分

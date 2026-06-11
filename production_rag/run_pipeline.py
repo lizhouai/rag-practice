@@ -45,10 +45,12 @@ BM25_TOP_N = 12
 RRF_K = 60
 RERANK_TOP_N = 12
 DEDUP_THRESHOLD = 0.92
+MMR_LAMBDA = 0.72
 FINAL_MAX_K = 5
 MIN_RERANK_SCORE = 0.12
 GAP_THRESHOLD = 0.28
 CONTEXT_TOKEN_BUDGET = 900
+PARENT_EXPANSION_MAX_CHARS = 1200
 DEFAULT_CHAT_MODEL = "deepseek-v4-pro"
 DEFAULT_EMBEDDING_MODEL = "embedding-3"
 DEFAULT_LLM_API_STYLE = "anthropic"
@@ -110,7 +112,43 @@ class Candidate:
     bm25_score: float | None = None
     rrf_score: float = 0.0
     rerank_score: float = 0.0
+    mmr_score: float = 0.0
     reason: str = ""
+
+
+@dataclass
+class ExternalReranker:
+    url: str
+    model: str = "bge-reranker-v2-m3"
+    timeout_seconds: int = 30
+    last_error: str = ""
+    fallback_used: bool = False
+
+    def score(self, query: str, chunks: list[Chunk]) -> list[float]:
+        body = {
+            "model": self.model,
+            "query": query,
+            "documents": [
+                {
+                    "id": chunk.chunk_id,
+                    "text": chunk.text,
+                    "metadata": {
+                        "doc_id": chunk.doc_id,
+                        "title_path": " > ".join(chunk.title_path),
+                    },
+                }
+                for chunk in chunks
+            ],
+        }
+        request = urllib.request.Request(
+            self.url,
+            data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        return parse_reranker_scores(payload, expected_count=len(chunks))
 
 
 @dataclass
@@ -1097,7 +1135,50 @@ def rrf_fuse(
     return dict(sorted(candidates.items(), key=lambda pair: pair[1].rrf_score, reverse=True))
 
 
-def rerank(query: str, candidates: dict[str, Candidate], chunks_by_id: dict[str, Chunk]) -> list[Candidate]:
+def parse_reranker_scores(payload: dict, expected_count: int) -> list[float]:
+    if isinstance(payload.get("scores"), list):
+        scores = [float(score) for score in payload["scores"]]
+    elif isinstance(payload.get("results"), list):
+        scores = [0.0] * expected_count
+        for item in payload["results"]:
+            if not isinstance(item, dict):
+                continue
+            index = int(item.get("index", -1))
+            if 0 <= index < expected_count:
+                scores[index] = float(item.get("score", item.get("relevance_score", 0.0)))
+    else:
+        raise RuntimeError("Reranker response must include `scores` or `results`.")
+    if len(scores) != expected_count:
+        raise RuntimeError(f"Reranker returned {len(scores)} scores for {expected_count} documents.")
+    return scores
+
+
+def make_external_reranker(
+    url: str,
+    *,
+    model: str = "bge-reranker-v2-m3",
+    timeout_seconds: int = 30,
+) -> ExternalReranker:
+    return ExternalReranker(url=url, model=model, timeout_seconds=timeout_seconds)
+
+
+def make_configured_external_reranker() -> ExternalReranker | None:
+    provider = os.getenv("RERANKER_PROVIDER", "rule").strip().lower()
+    url = os.getenv("RERANKER_URL", "").strip()
+    if provider in {"", "rule", "local_rule"} and not url:
+        return None
+    if not url and provider == "ollama":
+        url = "http://localhost:11434/api/rerank"
+    if not url:
+        return None
+    return make_external_reranker(
+        url,
+        model=os.getenv("RERANKER_MODEL", "bge-reranker-v2-m3"),
+        timeout_seconds=parse_int_env("RERANKER_TIMEOUT_SECONDS", 30),
+    )
+
+
+def rule_rerank(query: str, candidates: dict[str, Candidate], chunks_by_id: dict[str, Chunk]) -> list[Candidate]:
     query_terms = set(tokenize(query))
     ranked: list[Candidate] = []
     for candidate in candidates.values():
@@ -1127,6 +1208,32 @@ def rerank(query: str, candidates: dict[str, Candidate], chunks_by_id: dict[str,
     return sorted(ranked, key=lambda item: item.rerank_score, reverse=True)[:RERANK_TOP_N]
 
 
+def rerank(
+    query: str,
+    candidates: dict[str, Candidate],
+    chunks_by_id: dict[str, Chunk],
+    *,
+    external_reranker: ExternalReranker | None = None,
+) -> list[Candidate]:
+    if not external_reranker:
+        return rule_rerank(query, candidates, chunks_by_id)
+    ordered_candidates = list(candidates.values())
+    chunks = [chunks_by_id[candidate.chunk_id] for candidate in ordered_candidates]
+    try:
+        scores = external_reranker.score(query, chunks)
+    except Exception as exc:  # noqa: BLE001 - starter fallback should keep the demo runnable.
+        external_reranker.last_error = str(exc)
+        external_reranker.fallback_used = True
+        fallback = rule_rerank(query, candidates, chunks_by_id)
+        for candidate in fallback:
+            candidate.reason = f"rule_fallback_after_external_error: {candidate.reason}".strip()
+        return fallback
+    for candidate, score in zip(ordered_candidates, scores):
+        candidate.rerank_score = score
+        candidate.reason = f"external_reranker:{external_reranker.model}"
+    return sorted(ordered_candidates, key=lambda item: item.rerank_score, reverse=True)[:RERANK_TOP_N]
+
+
 def semantic_dedup(ranked: list[Candidate], chunks_by_id: dict[str, Chunk]) -> tuple[list[Candidate], list[dict]]:
     kept: list[Candidate] = []
     dropped: list[dict] = []
@@ -1150,6 +1257,62 @@ def semantic_dedup(ranked: list[Candidate], chunks_by_id: dict[str, Chunk]) -> t
         else:
             kept.append(candidate)
     return kept, dropped
+
+
+def mmr_select(
+    ranked: list[Candidate],
+    chunks_by_id: dict[str, Chunk],
+    *,
+    limit: int = RERANK_TOP_N,
+    lambda_mult: float = MMR_LAMBDA,
+    duplicate_threshold: float = DEDUP_THRESHOLD,
+) -> tuple[list[Candidate], list[dict]]:
+    if not ranked:
+        return [], []
+    remaining = sorted(ranked, key=lambda item: item.rerank_score, reverse=True)
+    max_score = max(abs(item.rerank_score) for item in remaining) or 1.0
+    selected: list[Candidate] = []
+    dropped: list[dict] = []
+
+    while remaining and len(selected) < limit:
+        best: Candidate | None = None
+        best_score = float("-inf")
+        next_remaining: list[Candidate] = []
+        for candidate in remaining:
+            chunk = chunks_by_id[candidate.chunk_id]
+            if selected:
+                similarities = [
+                    cosine(chunk.dense_vector, chunks_by_id[item.chunk_id].dense_vector)
+                    for item in selected
+                ]
+                max_similarity = max(similarities) if similarities else 0.0
+                if max_similarity >= duplicate_threshold:
+                    duplicate_of = selected[similarities.index(max_similarity)]
+                    dropped.append(
+                        {
+                            "chunk_id": candidate.chunk_id,
+                            "duplicate_of": duplicate_of.chunk_id,
+                            "similarity": round(max_similarity, 4),
+                            "reason": "near_duplicate",
+                        }
+                    )
+                    continue
+            else:
+                max_similarity = 0.0
+            relevance = candidate.rerank_score / max_score
+            candidate.mmr_score = lambda_mult * relevance - (1 - lambda_mult) * max_similarity
+            if candidate.mmr_score > best_score:
+                if best is not None:
+                    next_remaining.append(best)
+                best = candidate
+                best_score = candidate.mmr_score
+            else:
+                next_remaining.append(candidate)
+        if best is None:
+            break
+        selected.append(best)
+        remaining = next_remaining
+    return selected, dropped
 
 
 def dynamic_truncate(candidates: list[Candidate], chunks_by_id: dict[str, Chunk]) -> tuple[list[Candidate], dict]:
@@ -1244,15 +1407,55 @@ def sufficiency_check(
     }
 
 
+def build_chunks_by_parent(chunks: list[Chunk]) -> dict[str, list[Chunk]]:
+    chunks_by_parent: dict[str, list[Chunk]] = defaultdict(list)
+    for chunk in chunks:
+        chunks_by_parent[chunk.parent_id].append(chunk)
+    for parent_chunks in chunks_by_parent.values():
+        parent_chunks.sort(key=lambda item: item.chunk_id)
+    return chunks_by_parent
+
+
+def expand_parent_context(
+    chunk: Chunk,
+    chunks_by_parent: dict[str, list[Chunk]] | None,
+    *,
+    max_chars: int = PARENT_EXPANSION_MAX_CHARS,
+) -> tuple[str, list[str], int]:
+    if not chunks_by_parent:
+        return chunk.text, [chunk.chunk_id], chunk.token_count
+    siblings = chunks_by_parent.get(chunk.parent_id) or [chunk]
+    text_parts: list[str] = []
+    expanded_ids: list[str] = []
+    token_total = 0
+    for sibling in siblings:
+        candidate_text = "\n\n".join([*text_parts, sibling.text]).strip()
+        if len(candidate_text) > max_chars and sibling.chunk_id != chunk.chunk_id:
+            continue
+        text_parts.append(sibling.text)
+        expanded_ids.append(sibling.chunk_id)
+        token_total += sibling.token_count
+    if chunk.chunk_id not in expanded_ids:
+        text_parts.append(chunk.text)
+        expanded_ids.append(chunk.chunk_id)
+        token_total += chunk.token_count
+    return "\n\n".join(text_parts).strip(), expanded_ids, token_total
+
+
 def assemble_context(
     query: str,
     selected: list[Candidate],
     chunks_by_id: dict[str, Chunk],
     sufficiency: dict,
+    *,
+    chunks_by_parent: dict[str, list[Chunk]] | None = None,
 ) -> dict:
     evidence = []
+    estimated_token_total = 0
     for index, candidate in enumerate(selected, start=1):
         chunk = chunks_by_id[candidate.chunk_id]
+        expanded_text, expanded_ids, expanded_tokens = expand_parent_context(chunk, chunks_by_parent)
+        estimated_token_total += expanded_tokens
         role = "primary" if index == 1 else "supporting"
         if any(word in chunk.text for word in ("不支持", "不能", "除非")):
             role = "exception" if index > 1 else "primary"
@@ -1267,8 +1470,10 @@ def assemble_context(
                 "version": chunk.metadata.get("version", ""),
                 "effective_from": chunk.metadata.get("effective_from", ""),
                 "rerank_score": round(candidate.rerank_score, 4),
+                "mmr_score": round(candidate.mmr_score, 4),
                 "evidence_role": role,
-                "text": chunk.text,
+                "expanded_from_chunk_ids": expanded_ids,
+                "text": expanded_text,
             }
         )
     return {
@@ -1279,6 +1484,7 @@ def assemble_context(
             "关键事实必须就近引用资料编号",
         ],
         "sufficiency": sufficiency,
+        "estimated_token_total": estimated_token_total,
         "evidence": evidence,
     }
 
@@ -1447,6 +1653,8 @@ def build_monitoring_event(trace: dict, latency_ms: int, status: str) -> dict:
     selected_doc_ids = sorted({item.get("doc_id", "") for item in trace.get("context_packet", {}).get("evidence", []) if item.get("doc_id")})
     validation = trace.get("validation", {})
     model_config = trace.get("model_config", {})
+    selection_strategy = trace.get("selection_strategy", {})
+    reranker = trace.get("reranker", {})
     return {
         "timestamp": datetime.now().isoformat(timespec="seconds"),
         "trace_id": trace["trace_id"],
@@ -1471,8 +1679,16 @@ def build_monitoring_event(trace: dict, latency_ms: int, status: str) -> dict:
         "dedup_dropped_count": len(trace.get("dedup_dropped", [])),
         "selected_count": trace.get("truncation", {}).get("selected_count", 0),
         "selected_doc_ids": selected_doc_ids,
-        "context_token_total": trace.get("truncation", {}).get("token_total", 0),
+        "context_token_total": trace.get("context_packet", {}).get(
+            "estimated_token_total",
+            trace.get("truncation", {}).get("token_total", 0),
+        ),
         "blocked_match_count": len(trace.get("permission_filter", {}).get("blocked_matches", [])),
+        "stage_latencies_ms": trace.get("stage_latencies_ms", {}),
+        "selection_strategy": selection_strategy.get("name", selection_strategy),
+        "reranker_mode": reranker.get("mode"),
+        "reranker_model": reranker.get("model"),
+        "reranker_fallback_used": reranker.get("fallback_used", False),
     }
 
 
@@ -1513,7 +1729,9 @@ def run_query(
     metrics_path: Path = METRICS_PATH,
 ) -> dict:
     started = time.perf_counter()
+    stage_latencies_ms: dict[str, int] = {}
     scopes = allowed_scopes or DEFAULT_ALLOWED_SCOPES
+    stage_started = time.perf_counter()
     embedder = make_embedding_function() if real_models else None
     embedding_model = (
         env_first("EMBEDDING_MODEL", default=DEFAULT_EMBEDDING_MODEL)
@@ -1532,12 +1750,18 @@ def run_query(
         rebuild=rebuild_index,
         embedding_model=embedding_model,
     )
+    stage_latencies_ms["index_sync"] = int((time.perf_counter() - stage_started) * 1000)
+
+    stage_started = time.perf_counter()
     all_chunks = vector_store.load_chunks()
     chunks, rejected_chunks = filter_chunks_for_access(all_chunks, scopes)
     permission_blocked_matches = find_permission_blocked_matches(query, all_chunks, rejected_chunks)
     parents_count = len({chunk.parent_id for chunk in chunks})
     chunks_by_id = {chunk.chunk_id: chunk for chunk in chunks}
+    chunks_by_parent = build_chunks_by_parent(chunks)
+    stage_latencies_ms["access_filter"] = int((time.perf_counter() - stage_started) * 1000)
 
+    stage_started = time.perf_counter()
     if vector_backend == "qdrant":
         query_vector = embedder([query])[0] if embedder else vectorize(tokenize(query))
         dense_results = [
@@ -1547,19 +1771,58 @@ def run_query(
         ]
     else:
         dense_results = dense_recall(query, chunks)
+    stage_latencies_ms["dense_recall"] = int((time.perf_counter() - stage_started) * 1000)
+
+    stage_started = time.perf_counter()
     bm25_results = bm25_recall(query, chunks)
+    stage_latencies_ms["bm25_recall"] = int((time.perf_counter() - stage_started) * 1000)
+
+    stage_started = time.perf_counter()
     fused = rrf_fuse(dense_results, bm25_results)
-    reranked = rerank(query, fused, chunks_by_id)
-    deduped, dedup_dropped = semantic_dedup(reranked, chunks_by_id)
-    selected, truncation = dynamic_truncate(deduped, chunks_by_id)
+    stage_latencies_ms["rrf_fusion"] = int((time.perf_counter() - stage_started) * 1000)
+
+    external_reranker = make_configured_external_reranker()
+    stage_started = time.perf_counter()
+    reranked = rerank(query, fused, chunks_by_id, external_reranker=external_reranker)
+    stage_latencies_ms["rerank"] = int((time.perf_counter() - stage_started) * 1000)
+    reranker_info = {
+        "mode": "external" if external_reranker and not external_reranker.fallback_used else "rule",
+        "model": external_reranker.model if external_reranker else "local_rule",
+        "url": external_reranker.url if external_reranker else "",
+        "fallback_used": external_reranker.fallback_used if external_reranker else False,
+        "error": external_reranker.last_error if external_reranker else "",
+    }
+
+    stage_started = time.perf_counter()
+    diversified, dedup_dropped = mmr_select(reranked, chunks_by_id)
+    stage_latencies_ms["mmr"] = int((time.perf_counter() - stage_started) * 1000)
+
+    stage_started = time.perf_counter()
+    selected, truncation = dynamic_truncate(diversified, chunks_by_id)
+    stage_latencies_ms["truncate"] = int((time.perf_counter() - stage_started) * 1000)
+
+    stage_started = time.perf_counter()
     sufficiency = sufficiency_check(
         query,
         selected,
         chunks_by_id,
         permission_blocked_matches=permission_blocked_matches,
     )
-    context_packet = assemble_context(query, selected, chunks_by_id, sufficiency)
+    stage_latencies_ms["sufficiency"] = int((time.perf_counter() - stage_started) * 1000)
+
+    stage_started = time.perf_counter()
+    context_packet = assemble_context(
+        query,
+        selected,
+        chunks_by_id,
+        sufficiency,
+        chunks_by_parent=chunks_by_parent,
+    )
+    stage_latencies_ms["context"] = int((time.perf_counter() - stage_started) * 1000)
+
+    stage_started = time.perf_counter()
     answer = generate_answer_with_llm(context_packet) if real_models else generate_answer(context_packet)
+    stage_latencies_ms["answer"] = int((time.perf_counter() - stage_started) * 1000)
     validation = validate_citations(answer, context_packet)
 
     trace = {
@@ -1591,11 +1854,19 @@ def run_query(
         "bm25_top": summarize_results(bm25_results),
         "rrf_top": [asdict(item) for item in list(fused.values())[:10]],
         "rerank_top": [asdict(item) for item in reranked],
+        "selection_strategy": {
+            "name": "mmr",
+            "lambda": MMR_LAMBDA,
+            "parent_expansion": True,
+            "parent_expansion_max_chars": PARENT_EXPANSION_MAX_CHARS,
+        },
+        "reranker": reranker_info,
         "dedup_dropped": dedup_dropped,
         "truncation": truncation,
         "context_packet": context_packet,
         "answer": answer,
         "validation": validation,
+        "stage_latencies_ms": stage_latencies_ms,
     }
     latency_ms = int((time.perf_counter() - started) * 1000)
     trace["monitoring_event"] = build_monitoring_event(trace, latency_ms=latency_ms, status="ok")
