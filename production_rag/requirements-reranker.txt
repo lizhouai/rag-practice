@@ -1,0 +1,8 @@
+# Optional local reranker service dependencies.
+# CPU-only PyTorch wheels can be installed from the official PyTorch index if needed.
+fastapi>=0.110
+uvicorn[standard]>=0.27
+FlagEmbedding>=1.2.10
+transformers>=4.40
+huggingface_hub>=0.23
+torch>=2.2

@@ -1,6 +1,6 @@
 # Dataset Sources
 
-This starter now includes a larger seed knowledge base under `data/raw/` and a script for importing open customer-support rows into Markdown casebooks. The checked-in seed documents are intentionally Chinese-first, with only three English support casebooks kept for cross-lingual retrieval tests.
+This practice project now includes a larger seed knowledge base under `data/raw/` and a script for importing open customer-support rows into Markdown casebooks. The checked-in seed documents are intentionally Chinese-first, with only three English support casebooks kept for cross-lingual retrieval tests.
 
 ## English Source Kept For Cross-Lingual Tests
 
@@ -9,7 +9,7 @@ This starter now includes a larger seed knowledge base under `data/raw/` and a s
 - License: MIT
 - Size: 1,000 rows
 - Format: Parquet
-- Why keep it: it is close to the starter domain, includes realistic customer-support conversations, has issue taxonomy fields, and uses a permissive license suitable for a production-style starter.
+- Why keep it: it is close to the practice domain, includes realistic customer-support conversations, has issue taxonomy fields, and uses a permissive license suitable for a production-style practice project.
 
 Import script:
 
@@ -39,5 +39,5 @@ These Chinese seed documents are not copied rows from a third-party dataset. The
 ## Other Sources Considered
 
 - `PaDaS-Lab/webfaq`: very large multilingual FAQ collection, CC BY 4.0. Useful for open-domain retrieval, but downstream users must check original website terms and Common Crawl constraints.
-- `OpenStellarTeam/Chinese-EcomQA`: Chinese e-commerce QA benchmark with 1,800 rows. Useful for Chinese e-commerce evaluation, but the license is CC BY-NC-SA 4.0, so it is less convenient for production or commercial starter defaults.
+- `OpenStellarTeam/Chinese-EcomQA`: Chinese e-commerce QA benchmark with 1,800 rows. Useful for Chinese e-commerce evaluation, but the license is CC BY-NC-SA 4.0, so it is less convenient for production or commercial practice defaults.
 - `JDDC 2.0`: large-scale Chinese e-commerce customer-service dialogue research corpus. Useful as a reference direction for Chinese customer-service RAG, but it is better treated as an external research resource unless the downstream project has verified its exact distribution and usage constraints.

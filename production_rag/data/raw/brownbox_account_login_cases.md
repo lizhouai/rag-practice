@@ -14,7 +14,7 @@ dataset_license: MIT
 
 # BrownBox Account Login and Verification Casebook
 
-This casebook expands the starter knowledge base with production-like account access support cases. It follows the issue taxonomy used by the open e-commerce customer support QA dataset and is written as long-form support knowledge so retrieval, BM25, RRF, rerank, truncation, deduplication, and citation validation have enough competing evidence.
+This casebook expands the practice knowledge base with production-like account access support cases. It follows the issue taxonomy used by the open e-commerce customer support QA dataset and is written as long-form support knowledge so retrieval, BM25, RRF, rerank, truncation, deduplication, and citation validation have enough competing evidence.
 
 ## Case 1: Mobile number or email verification during login
 

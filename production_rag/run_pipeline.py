@@ -25,7 +25,7 @@ ROOT = Path(__file__).resolve().parent
 RAW_DIR = ROOT / "data" / "raw"
 DEFAULT_RUNTIME_DIR = Path(
     os.getenv("RAG_RUNTIME_DIR")
-    or Path(os.getenv("TEMP") or os.getenv("TMPDIR") or "C:/tmp") / "production_rag_starter"
+    or Path(os.getenv("TEMP") or os.getenv("TMPDIR") or "C:/tmp") / "production_rag_runtime"
 )
 TRACE_DIR = DEFAULT_RUNTIME_DIR / "traces"
 EVAL_PATH = ROOT / "eval_cases.csv"
@@ -60,6 +60,9 @@ DEFAULT_ZHIPU_EMBEDDING_BASE_URL = "https://open.bigmodel.cn/api/paas/v4"
 DEFAULT_EMBEDDING_DIMENSIONS = 1024
 LOCAL_EMBEDDING_MODEL = "local-hash-embedding"
 DEFAULT_ALLOWED_SCOPES = {"internal", "public"}
+DEFAULT_RERANKER_MODEL = "bge-reranker-v2-m3"
+DEFAULT_RERANKER_URL = "http://127.0.0.1:8008/rerank"
+EXTERNAL_RERANKER_PROVIDERS = {"external", "http", "flagembedding", "transformers", "bge"}
 
 STOPWORDS = {
     "的",
@@ -119,7 +122,7 @@ class Candidate:
 @dataclass
 class ExternalReranker:
     url: str
-    model: str = "bge-reranker-v2-m3"
+    model: str = DEFAULT_RERANKER_MODEL
     timeout_seconds: int = 30
     last_error: str = ""
     fallback_used: bool = False
@@ -1156,7 +1159,7 @@ def parse_reranker_scores(payload: dict, expected_count: int) -> list[float]:
 def make_external_reranker(
     url: str,
     *,
-    model: str = "bge-reranker-v2-m3",
+    model: str = DEFAULT_RERANKER_MODEL,
     timeout_seconds: int = 30,
 ) -> ExternalReranker:
     return ExternalReranker(url=url, model=model, timeout_seconds=timeout_seconds)
@@ -1167,13 +1170,13 @@ def make_configured_external_reranker() -> ExternalReranker | None:
     url = os.getenv("RERANKER_URL", "").strip()
     if provider in {"", "rule", "local_rule"} and not url:
         return None
-    if not url and provider == "ollama":
-        url = "http://localhost:11434/api/rerank"
+    if not url and provider in EXTERNAL_RERANKER_PROVIDERS:
+        url = DEFAULT_RERANKER_URL
     if not url:
         return None
     return make_external_reranker(
         url,
-        model=os.getenv("RERANKER_MODEL", "bge-reranker-v2-m3"),
+        model=os.getenv("RERANKER_MODEL", "").strip() or DEFAULT_RERANKER_MODEL,
         timeout_seconds=parse_int_env("RERANKER_TIMEOUT_SECONDS", 30),
     )
 
@@ -1221,7 +1224,7 @@ def rerank(
     chunks = [chunks_by_id[candidate.chunk_id] for candidate in ordered_candidates]
     try:
         scores = external_reranker.score(query, chunks)
-    except Exception as exc:  # noqa: BLE001 - starter fallback should keep the demo runnable.
+    except Exception as exc:  # noqa: BLE001 - fallback should keep the practice runnable.
         external_reranker.last_error = str(exc)
         external_reranker.fallback_used = True
         fallback = rule_rerank(query, candidates, chunks_by_id)
@@ -1828,7 +1831,7 @@ def run_query(
     trace = {
         "trace_id": f"{datetime.now().strftime('%Y%m%d-%H%M%S-%f')}-{uuid.uuid4().hex[:8]}",
         "query": query,
-        "pipeline_version": "production_starter_pipeline_v2",
+        "pipeline_version": "production_rag_pipeline_v2",
         "index_version": index_sync["store"],
         "model_config": {
             "llm_model": env_first("LLM_MODEL", default=DEFAULT_CHAT_MODEL),
@@ -1954,7 +1957,7 @@ def run_eval(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Runnable starter pipeline for production RAG practice.")
+    parser = argparse.ArgumentParser(description="Runnable production_rag practice pipeline.")
     parser.add_argument("--query", help="Question to answer.")
     parser.add_argument("--trace-only", action="store_true", help="Print the full JSON trace instead of the answer view.")
     parser.add_argument("--save-trace", action="store_true", help="Also save the full JSON trace.")

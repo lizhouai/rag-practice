@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import importlib.util
+import os
 import sys
 import tempfile
 import unittest
@@ -200,6 +201,119 @@ class RetrievalPipelineEnhancementTest(unittest.TestCase):
         self.assertEqual(request_body["documents"][1]["id"], "second")
         self.assertEqual([item.chunk_id for item in ranked], ["second", "first"])
         self.assertEqual(ranked[0].reason, "external_reranker:bge-reranker-v2-m3")
+
+    def test_configured_reranker_uses_flagembedding_service_defaults(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "RERANKER_PROVIDER": "flagembedding",
+                "RERANKER_URL": "",
+                "RERANKER_MODEL": "",
+            },
+            clear=False,
+        ):
+            external = rag.make_configured_external_reranker()
+
+        self.assertIsNotNone(external)
+        assert external is not None
+        self.assertEqual(external.url, "http://127.0.0.1:8008/rerank")
+        self.assertEqual(external.model, "bge-reranker-v2-m3")
+
+    def test_bge_reranker_service_keeps_scores_in_request_order(self) -> None:
+        service_path = PROJECT_ROOT / "scripts" / "serve_bge_reranker.py"
+        spec = importlib.util.spec_from_file_location("serve_bge_reranker", service_path)
+        self.assertIsNotNone(spec)
+        assert spec is not None and spec.loader is not None
+        service = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(service)
+
+        class FakeBackend:
+            def __init__(self) -> None:
+                self.query = ""
+                self.documents: list[str] = []
+
+            def score(self, query: str, documents: list[str]) -> list[float]:
+                self.query = query
+                self.documents = documents
+                return [0.2, 0.95]
+
+        backend = FakeBackend()
+        response = service.score_payload(
+            {
+                "model": "bge-reranker-v2-m3",
+                "query": "SKU-A17 是否支持无理由退货？",
+                "documents": [
+                    {"id": "first", "text": "generic refund text"},
+                    {"id": "second", "text": "exact SKU-A17 no reason return policy"},
+                ],
+            },
+            backend=backend,
+        )
+
+        self.assertEqual(backend.query, "SKU-A17 是否支持无理由退货？")
+        self.assertEqual(backend.documents[1], "exact SKU-A17 no reason return policy")
+        self.assertEqual(response["model"], "BAAI/bge-reranker-v2-m3")
+        self.assertEqual(response["scores"], [0.2, 0.95])
+        self.assertEqual(response["results"][0]["id"], "second")
+        self.assertEqual(response["results"][0]["index"], 1)
+
+    def test_bge_reranker_service_can_use_local_model_directory(self) -> None:
+        service_path = PROJECT_ROOT / "scripts" / "serve_bge_reranker.py"
+        spec = importlib.util.spec_from_file_location("serve_bge_reranker", service_path)
+        self.assertIsNotNone(spec)
+        assert spec is not None and spec.loader is not None
+        service = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(service)
+
+        self.assertEqual(
+            service.resolve_model_reference("bge-reranker-v2-m3", "D:/models/bge-reranker-v2-m3"),
+            "D:/models/bge-reranker-v2-m3",
+        )
+        self.assertEqual(
+            service.resolve_model_reference("bge-reranker-v2-m3", ""),
+            "BAAI/bge-reranker-v2-m3",
+        )
+
+    def test_bge_reranker_model_load_error_explains_hf_endpoint_and_local_dir(self) -> None:
+        service_path = PROJECT_ROOT / "scripts" / "serve_bge_reranker.py"
+        spec = importlib.util.spec_from_file_location("serve_bge_reranker", service_path)
+        self.assertIsNotNone(spec)
+        assert spec is not None and spec.loader is not None
+        service = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(service)
+
+        message = service.format_model_load_error(
+            "BAAI/bge-reranker-v2-m3",
+            OSError("We couldn't connect to 'https://hf-mirror.com' to load the files."),
+        )
+
+        self.assertIn("BAAI/bge-reranker-v2-m3", message)
+        self.assertIn("hf-mirror.com", message)
+        self.assertIn("HF_ENDPOINT", message)
+        self.assertIn("RERANKER_MODEL_DIR", message)
+        self.assertIn("huggingface-cli download BAAI/bge-reranker-v2-m3", message)
+
+    def test_bge_reranker_service_loads_dotenv_without_overriding_shell_env(self) -> None:
+        service_path = PROJECT_ROOT / "scripts" / "serve_bge_reranker.py"
+        spec = importlib.util.spec_from_file_location("serve_bge_reranker", service_path)
+        self.assertIsNotNone(spec)
+        assert spec is not None and spec.loader is not None
+        service = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(service)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env_path = Path(tmpdir) / ".env"
+            env_path.write_text(
+                "RERANKER_MODEL_DIR=D:/models/from-dotenv\n"
+                "RERANKER_BACKEND=flagembedding\n",
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {"RERANKER_MODEL_DIR": "D:/models/from-shell"}, clear=False):
+                loaded = service.load_dotenv(env_path)
+                self.assertEqual(os.environ["RERANKER_MODEL_DIR"], "D:/models/from-shell")
+                self.assertEqual(os.environ["RERANKER_BACKEND"], "flagembedding")
+
+        self.assertEqual(loaded, {"RERANKER_BACKEND": "flagembedding"})
 
     def test_mmr_select_keeps_diverse_candidate_over_near_duplicate(self) -> None:
         primary = make_chunk("primary", "internal")
@@ -561,7 +675,7 @@ class CitationAndMonitoringTest(unittest.TestCase):
         self.assertEqual(event["reranker_mode"], "rule")
         self.assertEqual(event["reranker_fallback_used"], False)
 
-    def test_eval_cases_cover_starter_retrieval_and_permission_scenarios(self) -> None:
+    def test_eval_cases_cover_practice_retrieval_and_permission_scenarios(self) -> None:
         rows = list(rag.csv.DictReader(rag.EVAL_PATH.read_text(encoding="utf-8").splitlines()))
         case_ids = {row["case_id"] for row in rows}
 

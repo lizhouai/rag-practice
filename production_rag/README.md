@@ -39,11 +39,13 @@
 
 配套代码在本目录下：
 
-- `run_pipeline.py`：完整 Production RAG starter。
+- `run_pipeline.py`：完整 production_rag 练习主链路。
 - `data/raw/`：样例客服知识库。
 - `eval_cases.csv`：小型 golden set。
 - `docker-compose.yml`：本地 Qdrant 启动配置。
 - `.env.example`：DeepSeek / 智谱 / Qdrant 配置示例。
+- `requirements-reranker.txt`：可选本地 reranker 服务依赖。
+- `scripts/serve_bge_reranker.py`：`bge-reranker-v2-m3` 的 FlagEmbedding / Transformers HTTP 服务。
 - `scripts/import_customer_support_dataset.py`：可选数据集导入脚本。
 - `data/DATASET_SOURCES.md`：数据来源和取舍说明。
 - `tests/`：权限、增量同步、Qdrant、模型请求、引用校验和监控测试。
@@ -385,16 +387,62 @@ rrf_top
 - exact match bonus；
 - dense / BM25 双路命中奖励。
 
-有条件时，也可以接一个本地 CPU reranker 服务，例如用 `bge-reranker-v2-m3` 包一层 HTTP 服务。当前 starter 不强依赖 Ollama 的某个非标准接口，而是通过环境变量接入外部 reranker：
+有条件时，也可以接一个本地 CPU reranker 服务。这个项目推荐用 `FlagEmbedding` 或 `Transformers` 把 `BAAI/bge-reranker-v2-m3` 包成 HTTP 服务，而不是假设 Ollama 原生支持 rerank endpoint。
+
+先安装可选依赖：
+
+```bash
+python -m pip install -r requirements-reranker.txt
+```
+
+启动本地 reranker 服务：
+
+```bash
+RERANKER_BACKEND=flagembedding python scripts/serve_bge_reranker.py
+```
+
+如果本机 `FlagEmbedding` 安装不顺，也可以切到 Transformers 后端：
+
+```bash
+RERANKER_BACKEND=transformers python scripts/serve_bge_reranker.py
+```
+
+第一次启动时，`FlagEmbedding` / `Transformers` 会从 Hugging Face 下载 `BAAI/bge-reranker-v2-m3`。
+
+如果无法连上`https://huggingface.co/`，可以将`HF_ENDPOINT`设置成`https://hf-mirror.com`。
+
+如果看到类似下面的错误：
 
 ```text
-RERANKER_PROVIDER=ollama
-RERANKER_URL=http://localhost:11434/api/rerank
+OSError: We couldn't connect to 'https://hf-mirror.com' to load the files, and couldn't find them in the cached files.
+```
+
+说明当前 Python 进程连不上 `HF_ENDPOINT` 指向的镜像，而且本地缓存里也没有模型。可以换成可访问的 Hugging Face endpoint，或者先把模型下载到本地目录：
+
+```bash
+huggingface-cli download BAAI/bge-reranker-v2-m3 --local-dir D:/models/bge-reranker-v2-m3
+```
+
+然后启动服务时指定本地目录：
+
+```bash
+RERANKER_MODEL_DIR=D:/models/bge-reranker-v2-m3 RERANKER_BACKEND=flagembedding python scripts/serve_bge_reranker.py
+```
+
+`scripts/serve_bge_reranker.py` 启动时会读取当前目录下的 `.env`。如果报错里仍然显示正在加载 `BAAI/bge-reranker-v2-m3`，说明服务没有读到 `RERANKER_MODEL_DIR`；请确认变量写在 `production_rag/.env`，或者在同一个终端里先设置环境变量再启动服务。
+
+然后在 `.env` 里接入这个服务：
+
+```text
+RERANKER_PROVIDER=flagembedding
+RERANKER_URL=http://127.0.0.1:8008/rerank
 RERANKER_MODEL=bge-reranker-v2-m3
+# 如果已经预下载模型，也可以保留这个本地目录配置，方便下次启动服务。
+# RERANKER_MODEL_DIR=D:/models/bge-reranker-v2-m3
 RERANKER_TIMEOUT_SECONDS=30
 ```
 
-如果本地服务不可用，starter 会回退到规则 rerank，并在 trace 的 `reranker.fallback_used` 和 `reranker.error` 里记录原因。这样练习不会因为本地 reranker 没启动就中断。
+如果本地服务不可用，production_rag 会回退到规则 rerank，并在 trace 的 `reranker.fallback_used` 和 `reranker.error` 里记录原因。这样练习不会因为本地 reranker 没启动就中断。
 
 真实生产里，这一层通常会替换成专门的 rerank 模型，但它解决的问题不变：召回阶段先多拿候选，rerank 阶段再更细地判断证据相关性。
 
@@ -589,13 +637,13 @@ python run_pipeline.py --query "SKU-A17 是否支持无理由退货？" --real-m
 默认路径类似：
 
 ```text
-C:\Users\<you>\AppData\Local\Temp\production_rag_starter\traces\online_metrics.jsonl
+C:\Users\<you>\AppData\Local\Temp\production_rag_runtime\traces\online_metrics.jsonl
 ```
 
 也可以用环境变量覆盖运行目录：
 
 ```text
-RAG_RUNTIME_DIR=C:\tmp\production_rag_starter
+RAG_RUNTIME_DIR=C:\tmp\production_rag_runtime
 ```
 
 monitoring event 会记录：
@@ -620,7 +668,7 @@ monitoring event 会记录：
 python run_pipeline.py --query "SKU-A17 是否支持无理由退货？" --real-models --no-monitoring
 ```
 
-生产系统不应该把完整用户问题随手写进监控日志。这个 starter 默认写 `query_hash`，就是为了保留排障线索，同时减少敏感信息暴露。
+生产系统不应该把完整用户问题随手写进监控日志。这个项目默认写 `query_hash`，就是为了保留排障线索，同时减少敏感信息暴露。
 
 ## 9. 扩充数据集
 
