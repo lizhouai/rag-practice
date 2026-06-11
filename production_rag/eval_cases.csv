@@ -1,0 +1,7 @@
+case_id,query,expected_doc_id,must_answer,expected_terms
+case_001,跨境订单退款多久到账？,refund_policy_v3,true,7 到 15 个工作日
+case_002,SKU-A17 是否支持无理由退货？,refund_policy_v3,true,不支持 7 天无理由退款
+case_003,预售商品可以按 48 小时规则催单吗？,shipping_policy_v2,true,不能按照现货 48 小时规则催单
+case_004,会员积分可以提现吗？,member_policy_v1,true,不能提现
+case_005,今天北京天气怎么样？,,false,资料不足
+case_006,公开客服规则里在线客服多久首次响应？,public_service_basics_v1,true,2 小时内首次响应

@@ -1,0 +1,13 @@
+services:
+  qdrant:
+    # For production, pin QDRANT_IMAGE to a validated version instead of latest.
+    image: ${QDRANT_IMAGE:-qdrant/qdrant:latest}
+    container_name: production-rag-qdrant
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_storage:/qdrant/storage
+
+volumes:
+  qdrant_storage:
