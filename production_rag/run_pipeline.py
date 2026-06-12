@@ -35,6 +35,9 @@ METRICS_PATH = TRACE_DIR / "online_metrics.jsonl"
 DEFAULT_VECTOR_BACKEND = "qdrant"
 DEFAULT_QDRANT_URL = "http://localhost:6333"
 DEFAULT_QDRANT_COLLECTION = "production_rag_chunks"
+QDRANT_DENSE_VECTOR_NAME = "dense"
+QDRANT_BM25_VECTOR_NAME = "bm25"
+QDRANT_SPARSE_HASH_BUCKETS = 2_147_483_647
 QDRANT_PAYLOAD_INDEXES = {
     "doc_id": "keyword",
     "permission_scopes": "keyword",
@@ -538,6 +541,30 @@ def sqlite_fts_query(terms: list[str]) -> str:
     return " OR ".join(quoted_terms)
 
 
+def qdrant_sparse_index(term: str) -> int:
+    return int.from_bytes(hashlib.sha256(term.encode("utf-8")).digest()[:8], "big") % QDRANT_SPARSE_HASH_BUCKETS
+
+
+def qdrant_sparse_vector_from_terms(terms: list[str]) -> dict[str, list[int] | list[float]]:
+    counts: Counter[int] = Counter()
+    for term in terms:
+        if term:
+            counts[qdrant_sparse_index(term)] += 1
+    items = sorted(counts.items())
+    return {
+        "indices": [index for index, _ in items],
+        "values": [float(count) for _, count in items],
+    }
+
+
+def qdrant_point_dense_vector(raw_vector: object) -> list[float]:
+    if isinstance(raw_vector, dict):
+        vector = raw_vector.get(QDRANT_DENSE_VECTOR_NAME) or raw_vector.get("")
+    else:
+        vector = raw_vector
+    return list(vector) if isinstance(vector, list) else []
+
+
 class LocalVectorStore:
     def __init__(self, path: Path = DEFAULT_VECTOR_DB_PATH) -> None:
         self.path = path
@@ -1021,6 +1048,7 @@ class QdrantVectorStore:
         try:
             collection_info = request_json("GET", self.collection_url(), headers=self.headers(), ok_statuses=(200,))
             self.ensure_payload_indexes(collection_info)
+            self.ensure_sparse_vectors(collection_info)
             return
         except RuntimeError as exc:
             if "HTTP 404" not in str(exc):
@@ -1032,8 +1060,15 @@ class QdrantVectorStore:
                 ) from exc
         body = {
             "vectors": {
-                "size": self.vector_size,
-                "distance": "Cosine",
+                QDRANT_DENSE_VECTOR_NAME: {
+                    "size": self.vector_size,
+                    "distance": "Cosine",
+                },
+            },
+            "sparse_vectors": {
+                QDRANT_BM25_VECTOR_NAME: {
+                    "modifier": "idf",
+                },
             },
             "optimizers_config": {
                 "default_segment_number": 2,
@@ -1041,6 +1076,18 @@ class QdrantVectorStore:
         }
         request_json("PUT", self.collection_url(), body=body, headers=self.headers(), ok_statuses=(200,))
         self.ensure_payload_indexes()
+
+    def ensure_sparse_vectors(self, collection_info: dict | None = None) -> None:
+        existing = self.sparse_vectors_schema(collection_info)
+        if QDRANT_BM25_VECTOR_NAME in existing:
+            return
+        request_json(
+            "POST",
+            self.collection_url("/sparse_vectors"),
+            body={"sparse_vectors": {QDRANT_BM25_VECTOR_NAME: {"modifier": "idf"}}},
+            headers=self.headers(),
+            ok_statuses=(200,),
+        )
 
     def ensure_payload_indexes(self, collection_info: dict | None = None) -> None:
         existing = self.payload_schema(collection_info)
@@ -1070,6 +1117,23 @@ class QdrantVectorStore:
             return {}
         payload_schema = result.get("payload_schema", {})
         return payload_schema if isinstance(payload_schema, dict) else {}
+
+    @staticmethod
+    def sparse_vectors_schema(collection_info: dict | None) -> dict:
+        if not isinstance(collection_info, dict):
+            return {}
+        result = collection_info.get("result", {})
+        if not isinstance(result, dict):
+            return {}
+        config = result.get("config", {})
+        if not isinstance(config, dict):
+            return {}
+        params = config.get("params", {})
+        if not isinstance(params, dict):
+            return {}
+        sparse_vectors = params.get("sparse_vectors", {})
+        return sparse_vectors if isinstance(sparse_vectors, dict) else {}
+
 
     def reset(self) -> None:
         try:
@@ -1109,7 +1173,10 @@ class QdrantVectorStore:
         points = [
             {
                 "id": stable_point_id(chunk.chunk_id),
-                "vector": chunk.dense_vector,
+                "vector": {
+                    QDRANT_DENSE_VECTOR_NAME: chunk.dense_vector,
+                    QDRANT_BM25_VECTOR_NAME: qdrant_sparse_vector_from_terms(chunk.terms),
+                },
                 "payload": chunk_to_qdrant_payload(
                     chunk,
                     source_path=source_path,
@@ -1144,7 +1211,7 @@ class QdrantVectorStore:
         chunks: list[Chunk] = []
         for point in self.scroll_points(with_vector=with_vector, access_filter=access_filter):
             payload = point.get("payload", {})
-            vector = point.get("vector") or []
+            vector = qdrant_point_dense_vector(point.get("vector") or [])
             chunks.append(chunk_from_qdrant_payload(payload, vector=vector))
         return sorted(chunks, key=lambda chunk: chunk.chunk_id)
 
@@ -1217,6 +1284,7 @@ class QdrantVectorStore:
     ) -> list[tuple[float, Chunk]]:
         body: dict[str, object] = {
             "query": query_vector,
+            "using": QDRANT_DENSE_VECTOR_NAME,
             "limit": top_n,
             "with_payload": True,
             "with_vector": False,
@@ -1242,6 +1310,39 @@ class QdrantVectorStore:
                     ),
                 )
             )
+        return scored
+
+    def bm25_search(
+        self,
+        query: str,
+        allowed_scopes: set[str],
+        *,
+        top_n: int = BM25_TOP_N,
+        today: str | None = None,
+    ) -> list[tuple[float, Chunk]]:
+        query_sparse = qdrant_sparse_vector_from_terms(tokenize(query))
+        if not query_sparse["indices"]:
+            return []
+        body: dict[str, object] = {
+            "query": query_sparse,
+            "using": QDRANT_BM25_VECTOR_NAME,
+            "limit": top_n,
+            "with_payload": True,
+            "with_vector": False,
+            "filter": qdrant_access_filter(allowed_scopes, today),
+        }
+        payload = request_json(
+            "POST",
+            self.collection_url("/points/query"),
+            body=body,
+            headers=self.headers(),
+            ok_statuses=(200,),
+        )
+        result = payload.get("result", {})
+        points = result.get("points", result) if isinstance(result, dict) else result
+        scored: list[tuple[float, Chunk]] = []
+        for point in points or []:
+            scored.append((float(point.get("score", 0.0)), chunk_from_qdrant_payload(point.get("payload", {}))))
         return scored
 
 
@@ -2830,7 +2931,37 @@ def run_query(
     stage_latencies_ms["dense_recall"] = int((time.perf_counter() - stage_started) * 1000)
 
     stage_started = time.perf_counter()
-    bm25_results = lexical_store.bm25_search(query, scopes)
+    if resolved_vector_backend == "qdrant":
+        try:
+            bm25_results, attempts = call_with_retries(
+                lambda: vector_store.bm25_search(query, scopes, top_n=BM25_TOP_N)
+            )
+            vector_store_status["attempts"] = max(vector_store_status.get("attempts", 0), attempts)
+        except RetryExhausted as exc:
+            set_vector_store_fallback(vector_store_status, str(exc), exc.attempts)
+            lexical_store = LocalVectorStore(active_store_path)
+            vector_store = lexical_store
+            resolved_vector_backend = "local"
+            index_sync = index_status_without_rebuild(
+                vector_store=lexical_store,
+                store_path=active_store_path,
+                embedding_model=embedding_model,
+                embedding_identity_value=index_embedding_identity,
+                reason="qdrant_bm25_fallback",
+            )
+            (
+                all_chunks,
+                chunks,
+                rejected_chunks,
+                permission_blocked_matches,
+                parents_count,
+                chunks_by_id,
+                chunks_by_parent,
+            ) = load_access_state()
+            dense_results = dense_recall(query_vector, chunks)
+            bm25_results = lexical_store.bm25_search(query, scopes)
+    else:
+        bm25_results = lexical_store.bm25_search(query, scopes)
     stage_latencies_ms["bm25_recall"] = int((time.perf_counter() - stage_started) * 1000)
     for _, chunk in bm25_results:
         chunks_by_id.setdefault(chunk.chunk_id, chunk)

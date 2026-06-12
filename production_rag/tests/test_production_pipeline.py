@@ -1072,7 +1072,11 @@ class QdrantVectorStoreTest(unittest.TestCase):
         self.assertEqual(captured["headers"]["Api-key"], "qdrant-key")
         self.assertEqual(captured["timeout"], 90)
         self.assertEqual(body["points"][0]["id"], rag.stable_point_id("chunk-1"))
-        self.assertEqual(body["points"][0]["vector"], chunk.dense_vector)
+        self.assertEqual(body["points"][0]["vector"]["dense"], chunk.dense_vector)
+        self.assertEqual(
+            body["points"][0]["vector"]["bm25"],
+            rag.qdrant_sparse_vector_from_terms(chunk.terms),
+        )
         self.assertEqual(body["points"][0]["payload"]["doc_id"], "doc-1")
         self.assertEqual(body["points"][0]["payload"]["content_hash"], "hash-1")
 
@@ -1127,11 +1131,71 @@ class QdrantVectorStoreTest(unittest.TestCase):
         self.assertEqual(captured["url"], "http://qdrant.test/collections/rag_test/points/query")
         self.assertEqual(captured["method"], "POST")
         self.assertEqual(body["query"], [0.1, 0.2])
+        self.assertEqual(body["using"], "dense")
         self.assertEqual(body["limit"], 3)
         self.assertEqual(body["with_vector"], False)
         self.assertEqual(results[0][0], 0.87)
         self.assertEqual(results[0][1].chunk_id, "chunk-1")
         self.assertEqual(results[0][1].dense_vector, [])
+
+    def test_bm25_search_uses_qdrant_sparse_vector_query(self) -> None:
+        chunk = make_chunk("chunk-1", "internal")
+        chunk.terms = rag.tokenize("refund timeline")
+        payload = rag.chunk_to_qdrant_payload(
+            chunk,
+            source_path="data/raw/doc.md",
+            content_hash="hash-1",
+            embedding_model="embedding-3",
+        )
+
+        class FakeResponse:
+            def __enter__(self) -> "FakeResponse":
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return json.dumps(
+                    {
+                        "result": {
+                            "points": [
+                                {
+                                    "id": rag.stable_point_id(chunk.chunk_id),
+                                    "score": 4.2,
+                                    "payload": payload,
+                                }
+                            ]
+                        }
+                    }
+                ).encode("utf-8")
+
+        captured: dict[str, object] = {}
+
+        def fake_urlopen(request: urllib.request.Request, timeout: int) -> FakeResponse:
+            captured["url"] = request.full_url
+            captured["method"] = request.get_method()
+            captured["body"] = request.data
+            return FakeResponse()
+
+        store = rag.QdrantVectorStore(
+            base_url="http://qdrant.test",
+            collection_name="rag_test",
+            vector_size=64,
+        )
+        with patch("urllib.request.urlopen", fake_urlopen):
+            results = store.bm25_search("refund timeline", {"internal"}, top_n=3, today="2026-06-07")
+
+        body = json.loads(captured["body"].decode("utf-8"))
+        self.assertEqual(captured["url"], "http://qdrant.test/collections/rag_test/points/query")
+        self.assertEqual(captured["method"], "POST")
+        self.assertEqual(body["query"], rag.qdrant_sparse_vector_from_terms(rag.tokenize("refund timeline")))
+        self.assertEqual(body["using"], "bm25")
+        self.assertEqual(body["limit"], 3)
+        self.assertEqual(body["with_vector"], False)
+        self.assertEqual(body["filter"], rag.qdrant_access_filter({"internal"}, "2026-06-07"))
+        self.assertEqual(results[0][0], 4.2)
+        self.assertEqual(results[0][1].chunk_id, "chunk-1")
 
 
 class ProviderClientTest(unittest.TestCase):

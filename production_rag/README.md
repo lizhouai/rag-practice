@@ -324,7 +324,7 @@ QDRANT_URL = http://localhost:6333
 QDRANT_COLLECTION = production_rag_chunks
 ```
 
-`QdrantVectorStore` 负责创建 collection、写入 points、查询 points，并为 `doc_id` 创建 payload index。手动重建需要按 `doc_id` 删除旧 chunk，所以这个 payload index 不是可有可无。
+`QdrantVectorStore` 负责创建 collection、写入 points、查询 points，并为 `doc_id` 创建 payload index。每个 point 会同时写入 named dense vector 和 `bm25` sparse vector；手动重建需要按 `doc_id` 删除旧 chunk，所以这个 payload index 不是可有可无。
 
 如果看到：
 
@@ -352,7 +352,7 @@ python run_pipeline.py --query "跨境退款一般几天能回到卡里？" --tr
 
 ### 第七步：BM25 recall
 
-关键词召回由 SQLite FTS5 的 `bm25()` 完成，并在 SQL 查询里同时应用权限和生效期过滤。`bm25_recall()` 仍保留为纯函数对照。
+Qdrant 模式下，关键词召回走 Qdrant 的 `bm25` sparse vector，并在 Qdrant 查询里同时应用权限和生效期 filter。只有 `--vector-backend local` 时才使用 SQLite FTS5 的 `bm25()`。`bm25_recall()` 仍保留为纯函数对照。
 
 它对这类问题尤其有用：
 
