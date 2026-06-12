@@ -50,6 +50,8 @@ MIN_RERANK_SCORE = 0.12
 GAP_THRESHOLD = 0.28
 CONTEXT_TOKEN_BUDGET = 900
 PARENT_EXPANSION_MAX_CHARS = 1200
+SCORE_POLICY_EXTERNAL_RERANK = "external_rerank"
+SCORE_POLICY_RRF_ONLY = "rrf_only"
 DEFAULT_CHAT_MODEL = "deepseek-v4-pro"
 DEFAULT_EMBEDDING_MODEL = "embedding-3"
 DEFAULT_LLM_API_STYLE = "anthropic"
@@ -116,6 +118,14 @@ class Candidate:
     rerank_score: float = 0.0
     mmr_score: float = 0.0
     reason: str = ""
+
+
+@dataclass
+class SelectedEvidence:
+    candidate: Candidate
+    expanded_text: str
+    expanded_from_chunk_ids: list[str]
+    expanded_token_count: int
 
 
 @dataclass
@@ -1178,9 +1188,9 @@ def make_external_reranker(
 
 
 def make_configured_external_reranker() -> ExternalReranker | None:
-    provider = os.getenv("RERANKER_PROVIDER", "rule").strip().lower()
+    provider = os.getenv("RERANKER_PROVIDER", "").strip().lower()
     url = os.getenv("RERANKER_URL", "").strip()
-    if provider in {"", "rule", "local_rule"} and not url:
+    if not provider and not url:
         return None
     if not url and provider in EXTERNAL_RERANKER_PROVIDERS:
         url = DEFAULT_RERANKER_URL
@@ -1193,34 +1203,12 @@ def make_configured_external_reranker() -> ExternalReranker | None:
     )
 
 
-def rule_rerank(query: str, candidates: dict[str, Candidate], chunks_by_id: dict[str, Chunk]) -> list[Candidate]:
-    query_terms = set(tokenize(query))
-    ranked: list[Candidate] = []
-    for candidate in candidates.values():
-        chunk = chunks_by_id[candidate.chunk_id]
-        title_terms = set(tokenize(" ".join(chunk.title_path)))
-        body_terms = set(chunk.terms)
-        overlap = query_terms & body_terms
-        title_overlap = query_terms & title_terms
-        exact_bonus = 0.16 if any(term in chunk.text.lower() for term in query_terms) else 0.0
-        dual_route_bonus = 0.08 if candidate.dense_rank and candidate.bm25_rank else 0.0
-        candidate.rerank_score = (
-            0.42 * candidate.rrf_score
-            + 0.08 * len(overlap)
-            + 0.12 * len(title_overlap)
-            + exact_bonus
-            + dual_route_bonus
-        )
-        reason_parts = []
-        if candidate.dense_rank:
-            reason_parts.append(f"dense#{candidate.dense_rank}")
-        if candidate.bm25_rank:
-            reason_parts.append(f"bm25#{candidate.bm25_rank}")
-        if title_overlap:
-            reason_parts.append("title_match=" + "/".join(sorted(title_overlap)))
-        candidate.reason = ", ".join(reason_parts)
-        ranked.append(candidate)
-    return sorted(ranked, key=lambda item: item.rerank_score, reverse=True)[:RERANK_TOP_N]
+def skip_rerank(candidates: dict[str, Candidate], reason: str) -> list[Candidate]:
+    ranked = sorted(candidates.values(), key=lambda item: item.rrf_score, reverse=True)[:RERANK_TOP_N]
+    for candidate in ranked:
+        candidate.rerank_score = candidate.rrf_score
+        candidate.reason = f"rerank_skipped:{reason}"
+    return ranked
 
 
 def rerank(
@@ -1231,22 +1219,50 @@ def rerank(
     external_reranker: ExternalReranker | None = None,
 ) -> list[Candidate]:
     if not external_reranker:
-        return rule_rerank(query, candidates, chunks_by_id)
+        return skip_rerank(candidates, "no_configured_model")
     ordered_candidates = list(candidates.values())
     chunks = [chunks_by_id[candidate.chunk_id] for candidate in ordered_candidates]
     try:
         scores = external_reranker.score(query, chunks)
-    except Exception as exc:  # noqa: BLE001 - fallback should keep the practice runnable.
+    except Exception as exc:  # noqa: BLE001 - a configured reranker failure should not stop retrieval.
         external_reranker.last_error = str(exc)
-        external_reranker.fallback_used = True
-        fallback = rule_rerank(query, candidates, chunks_by_id)
-        for candidate in fallback:
-            candidate.reason = f"rule_fallback_after_external_error: {candidate.reason}".strip()
-        return fallback
+        return skip_rerank(candidates, "reranker_error")
     for candidate, score in zip(ordered_candidates, scores):
         candidate.rerank_score = score
         candidate.reason = f"external_reranker:{external_reranker.model}"
     return sorted(ordered_candidates, key=lambda item: item.rerank_score, reverse=True)[:RERANK_TOP_N]
+
+
+def describe_reranker(external_reranker: ExternalReranker | None) -> dict:
+    if external_reranker is None:
+        return {
+            "mode": "skipped",
+            "reason": "not_configured",
+            "model": "",
+            "url": "",
+            "fallback_used": False,
+            "error": "",
+            "score_policy": SCORE_POLICY_RRF_ONLY,
+        }
+    if external_reranker.last_error:
+        return {
+            "mode": "skipped",
+            "reason": "reranker_error",
+            "model": external_reranker.model,
+            "url": external_reranker.url,
+            "fallback_used": False,
+            "error": external_reranker.last_error,
+            "score_policy": SCORE_POLICY_RRF_ONLY,
+        }
+    return {
+        "mode": "external",
+        "reason": "configured_model",
+        "model": external_reranker.model,
+        "url": external_reranker.url,
+        "fallback_used": False,
+        "error": "",
+        "score_policy": SCORE_POLICY_EXTERNAL_RERANK,
+    }
 
 
 def semantic_dedup(ranked: list[Candidate], chunks_by_id: dict[str, Chunk]) -> tuple[list[Candidate], list[dict]]:
@@ -1330,13 +1346,27 @@ def mmr_select(
     return selected, dropped
 
 
-def dynamic_truncate(candidates: list[Candidate], chunks_by_id: dict[str, Chunk]) -> tuple[list[Candidate], dict]:
-    filtered = [item for item in candidates if item.rerank_score >= MIN_RERANK_SCORE]
+def dynamic_truncate(
+    candidates: list[Candidate],
+    chunks_by_id: dict[str, Chunk],
+    *,
+    chunks_by_parent: dict[str, list[Chunk]] | None = None,
+    score_policy: str = SCORE_POLICY_EXTERNAL_RERANK,
+    min_score: float | None = MIN_RERANK_SCORE,
+    gap_threshold: float | None = GAP_THRESHOLD,
+) -> tuple[list[SelectedEvidence], dict]:
+    if score_policy == SCORE_POLICY_RRF_ONLY:
+        min_score = None
+        gap_threshold = None
+    filtered = list(candidates) if min_score is None else [item for item in candidates if item.rerank_score >= min_score]
     reason = {
-        "min_score": MIN_RERANK_SCORE,
-        "gap_threshold": GAP_THRESHOLD,
+        "score_policy": score_policy,
+        "score_confidence": score_policy == SCORE_POLICY_EXTERNAL_RERANK,
+        "min_score": min_score,
+        "gap_threshold": gap_threshold,
         "max_k": FINAL_MAX_K,
         "context_token_budget": CONTEXT_TOKEN_BUDGET,
+        "budget_basis": "expanded_parent_context_tokens",
         "stop_reason": "max_k_or_budget",
     }
     if not filtered:
@@ -1344,22 +1374,35 @@ def dynamic_truncate(candidates: list[Candidate], chunks_by_id: dict[str, Chunk]
         return [], reason
 
     cutoff = len(filtered)
-    for index in range(len(filtered) - 1):
-        gap = filtered[index].rerank_score - filtered[index + 1].rerank_score
-        if gap >= GAP_THRESHOLD:
-            cutoff = index + 1
-            reason["stop_reason"] = "gap_cutoff"
-            reason["gap"] = round(gap, 4)
-            break
+    if gap_threshold is not None:
+        for index in range(len(filtered) - 1):
+            gap = filtered[index].rerank_score - filtered[index + 1].rerank_score
+            if gap >= gap_threshold:
+                cutoff = index + 1
+                reason["stop_reason"] = "gap_cutoff"
+                reason["gap"] = round(gap, 4)
+                break
 
-    selected: list[Candidate] = []
+    selected: list[SelectedEvidence] = []
     token_total = 0
     for candidate in filtered[:cutoff]:
-        token_total += chunks_by_id[candidate.chunk_id].token_count
-        if len(selected) >= FINAL_MAX_K or token_total > CONTEXT_TOKEN_BUDGET:
+        if len(selected) >= FINAL_MAX_K:
             reason["stop_reason"] = "max_k_or_budget"
             break
-        selected.append(candidate)
+        chunk = chunks_by_id[candidate.chunk_id]
+        expanded_text, expanded_ids, expanded_tokens = expand_parent_context(chunk, chunks_by_parent)
+        if token_total + expanded_tokens > CONTEXT_TOKEN_BUDGET:
+            reason["stop_reason"] = "max_k_or_budget"
+            break
+        selected.append(
+            SelectedEvidence(
+                candidate=candidate,
+                expanded_text=expanded_text,
+                expanded_from_chunk_ids=expanded_ids,
+                expanded_token_count=expanded_tokens,
+            )
+        )
+        token_total += expanded_tokens
     reason["selected_count"] = len(selected)
     reason["token_total"] = token_total
     return selected, reason
@@ -1386,6 +1429,9 @@ def sufficiency_check(
     chunks_by_id: dict[str, Chunk],
     *,
     permission_blocked_matches: list[dict] | None = None,
+    score_policy: str = SCORE_POLICY_EXTERNAL_RERANK,
+    min_score: float = MIN_RERANK_SCORE,
+    high_confidence_score: float | None = 0.35,
 ) -> dict:
     if is_out_of_domain_query(query):
         return {"enough": False, "reason": "out_of_domain_query"}
@@ -1413,11 +1459,40 @@ def sufficiency_check(
                 "blocked_overlap_ratio": round(blocked_ratio, 4),
                 "blocked_doc_ids": sorted({item["doc_id"] for item in permission_blocked_matches}),
             }
-    enough = best_score >= MIN_RERANK_SCORE and (coverage_ratio >= 0.18 or best_score >= 0.35)
+    if score_policy == SCORE_POLICY_RRF_ONLY:
+        lexical_coverage = set()
+        for candidate in selected:
+            if candidate.bm25_rank is not None:
+                lexical_coverage.update(query_terms & set(chunks_by_id[candidate.chunk_id].terms))
+        lexical_coverage_ratio = len(lexical_coverage) / max(1, len(query_terms))
+        has_lexical_signal = bool(lexical_coverage)
+        enough = lexical_coverage_ratio >= 0.18
+        if enough:
+            reason = "pass"
+        elif not has_lexical_signal:
+            reason = "rrf_only_missing_lexical_signal"
+        else:
+            reason = "low_query_evidence_overlap"
+        return {
+            "enough": enough,
+            "coverage_ratio": round(coverage_ratio, 4),
+            "best_rerank_score": round(best_score, 4),
+            "score_policy": score_policy,
+            "score_confidence": False,
+            "lexical_signal": has_lexical_signal,
+            "lexical_coverage_ratio": round(lexical_coverage_ratio, 4),
+            "reason": reason,
+        }
+    enough = best_score >= min_score and (
+        coverage_ratio >= 0.18
+        or (high_confidence_score is not None and best_score >= high_confidence_score)
+    )
     return {
         "enough": enough,
         "coverage_ratio": round(coverage_ratio, 4),
         "best_rerank_score": round(best_score, 4),
+        "score_policy": score_policy,
+        "score_confidence": True,
         "reason": "pass" if enough else "low_query_evidence_overlap",
     }
 
@@ -1459,7 +1534,7 @@ def expand_parent_context(
 
 def assemble_context(
     query: str,
-    selected: list[Candidate],
+    selected: list[Candidate | SelectedEvidence],
     chunks_by_id: dict[str, Chunk],
     sufficiency: dict,
     *,
@@ -1467,9 +1542,17 @@ def assemble_context(
 ) -> dict:
     evidence = []
     estimated_token_total = 0
-    for index, candidate in enumerate(selected, start=1):
+    for index, selection in enumerate(selected, start=1):
+        if isinstance(selection, SelectedEvidence):
+            candidate = selection.candidate
+            expanded_text = selection.expanded_text
+            expanded_ids = selection.expanded_from_chunk_ids
+            expanded_tokens = selection.expanded_token_count
+        else:
+            candidate = selection
+            chunk = chunks_by_id[candidate.chunk_id]
+            expanded_text, expanded_ids, expanded_tokens = expand_parent_context(chunk, chunks_by_parent)
         chunk = chunks_by_id[candidate.chunk_id]
-        expanded_text, expanded_ids, expanded_tokens = expand_parent_context(chunk, chunks_by_parent)
         estimated_token_total += expanded_tokens
         role = "primary" if index == 1 else "supporting"
         if any(word in chunk.text for word in ("不支持", "不能", "除非")):
@@ -1703,6 +1786,7 @@ def build_monitoring_event(trace: dict, latency_ms: int, status: str) -> dict:
         "selection_strategy": selection_strategy.get("name", selection_strategy),
         "reranker_mode": reranker.get("mode"),
         "reranker_model": reranker.get("model"),
+        "reranker_score_policy": reranker.get("score_policy"),
         "reranker_fallback_used": reranker.get("fallback_used", False),
     }
 
@@ -1802,28 +1886,30 @@ def run_query(
     stage_started = time.perf_counter()
     reranked = rerank(query, fused, chunks_by_id, external_reranker=external_reranker)
     stage_latencies_ms["rerank"] = int((time.perf_counter() - stage_started) * 1000)
-    reranker_info = {
-        "mode": "external" if external_reranker and not external_reranker.fallback_used else "rule",
-        "model": external_reranker.model if external_reranker else "local_rule",
-        "url": external_reranker.url if external_reranker else "",
-        "fallback_used": external_reranker.fallback_used if external_reranker else False,
-        "error": external_reranker.last_error if external_reranker else "",
-    }
+    reranker_info = describe_reranker(external_reranker)
+    score_policy = reranker_info["score_policy"]
 
     stage_started = time.perf_counter()
     diversified, dedup_dropped = mmr_select(reranked, chunks_by_id)
     stage_latencies_ms["mmr"] = int((time.perf_counter() - stage_started) * 1000)
 
     stage_started = time.perf_counter()
-    selected, truncation = dynamic_truncate(diversified, chunks_by_id)
+    selected, truncation = dynamic_truncate(
+        diversified,
+        chunks_by_id,
+        chunks_by_parent=chunks_by_parent,
+        score_policy=score_policy,
+    )
     stage_latencies_ms["truncate"] = int((time.perf_counter() - stage_started) * 1000)
 
     stage_started = time.perf_counter()
+    selected_candidates = [item.candidate for item in selected]
     sufficiency = sufficiency_check(
         query,
-        selected,
+        selected_candidates,
         chunks_by_id,
         permission_blocked_matches=permission_blocked_matches,
+        score_policy=score_policy,
     )
     stage_latencies_ms["sufficiency"] = int((time.perf_counter() - stage_started) * 1000)
 
@@ -1854,7 +1940,8 @@ def run_query(
             "embedding_model": embedding_model,
             "embedding_base_url": resolve_embedding_base_url() if real_models else "offline_hash",
             "vector_dimensions": vector_size,
-            "rerank_mode": "local_cross_encoder_style",
+            "rerank_mode": reranker_info["mode"],
+            "rerank_score_policy": score_policy,
             "vector_backend": vector_backend,
             "qdrant_url": resolve_qdrant_url() if vector_backend == "qdrant" else "",
             "qdrant_collection": resolve_qdrant_collection() if vector_backend == "qdrant" else "",

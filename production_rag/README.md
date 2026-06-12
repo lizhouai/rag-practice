@@ -378,14 +378,9 @@ rrf_top
 
 ### 第九步：rerank
 
-`rerank()` 会在融合候选上再做一次重排。
+`rerank()` 会在融合候选上调用已配置的 rerank 模型再做一次重排。
 
-默认情况下，它用本地规则模拟 cross-encoder 风格的信号：
-
-- query 和正文 term overlap；
-- query 和标题 term overlap；
-- exact match bonus；
-- dense / BM25 双路命中奖励。
+如果没有配置 rerank 模型，流程会跳过模型 rerank，直接把 RRF 融合后的候选交给后续 MMR 和动态截断。此时 RRF 只被当作同一 query 内的排序信号，不被当作相关性置信分。trace 中会记录 `reranker.mode=skipped`、`reranker.reason=not_configured`、`reranker.score_policy=rrf_only`，便于区分“没有模型重排”和“模型重排成功”。
 
 有条件时，也可以接一个本地 CPU reranker 服务。这个项目推荐用 `FlagEmbedding` 或 `Transformers` 把 `BAAI/bge-reranker-v2-m3` 包成 HTTP 服务，而不是假设 Ollama 原生支持 rerank endpoint。
 
@@ -442,7 +437,7 @@ RERANKER_MODEL=bge-reranker-v2-m3
 RERANKER_TIMEOUT_SECONDS=30
 ```
 
-如果本地服务不可用，production_rag 会回退到规则 rerank，并在 trace 的 `reranker.fallback_used` 和 `reranker.error` 里记录原因。这样练习不会因为本地 reranker 没启动就中断。
+如果已配置的 rerank 服务不可用，production_rag 不会回退到规则 rerank；它会跳过模型 rerank，继续使用 RRF 融合顺序，并在 trace 的 `reranker.mode=skipped`、`reranker.reason=reranker_error`、`reranker.score_policy=rrf_only` 和 `reranker.error` 里记录原因。这样练习不会因为本地 reranker 没启动就中断，也不会混用不同打分体系。
 
 真实生产里，这一层通常会替换成专门的 rerank 模型，但它解决的问题不变：召回阶段先多拿候选，rerank 阶段再更细地判断证据相关性。
 
@@ -452,15 +447,15 @@ RERANKER_TIMEOUT_SECONDS=30
 
 它同时考虑两件事：
 
-- 相关性：优先保留 rerank 分高的证据；
+- 相关性：有 rerank 模型时优先保留 rerank 分高的证据；跳过 rerank 时只按 RRF 排序信号保留候选；
 - 多样性：避免最终上下文里全是同一个 parent 或同一段话的近重复 chunk。
 
 近重复候选会进入 trace 的 `dedup_dropped`，并标记 `reason=near_duplicate`。
 
 `dynamic_truncate()` 会根据几个因素决定最终证据包：
 
-- 最低 rerank 分数；
-- 分数断崖；
+- 最低 rerank 分数；未配置 rerank 模型时不使用绝对分数门槛；
+- 分数断崖；未配置 rerank 模型时不使用 RRF gap 做断崖截断；
 - 最大证据条数；
 - context token 预算。
 
@@ -475,7 +470,8 @@ RERANKER_TIMEOUT_SECONDS=30
 - 问题明显超出业务域，比如天气、股票、新闻；
 - 没有选中证据；
 - 最相关资料被权限挡住；
-- query 和证据 overlap 太低。
+- query 和证据 overlap 太低；
+- 跳过 rerank 时，BM25 召回到的证据没有覆盖 query terms。
 
 试一个知识库外的问题：
 
@@ -657,7 +653,7 @@ monitoring event 会记录：
 - context token 估算；
 - 每个阶段的 `stage_latencies_ms`；
 - `selection_strategy`；
-- `reranker_mode`、`reranker_model`、`reranker_fallback_used`；
+- `reranker_mode`、`reranker_model`、`reranker_score_policy`、`reranker_fallback_used`；没有配置或服务报错时，`reranker_mode=skipped`，具体原因见 trace 的 `reranker.reason` / `reranker.error`；
 - `sufficiency_reason`、`permission_denied`；
 - `citation_valid`、`missing_citation_count`；
 - 最终选中的 `selected_doc_ids`。

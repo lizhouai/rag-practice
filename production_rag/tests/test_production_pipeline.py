@@ -191,6 +191,47 @@ class IncrementalSyncTest(unittest.TestCase):
 
 
 class RetrievalPipelineEnhancementTest(unittest.TestCase):
+    def test_dynamic_truncate_budgets_expanded_parent_context(self) -> None:
+        chunks: list[rag.Chunk] = []
+        candidates: list[rag.Candidate] = []
+        for index, score in enumerate((0.9, 0.85, 0.8), start=1):
+            anchor = make_chunk(f"parent{index}-anchor", "internal")
+            sibling = make_chunk(f"parent{index}-sibling", "internal")
+            parent_id = f"parent{index}"
+            anchor.parent_id = parent_id
+            sibling.parent_id = parent_id
+            anchor.text = f"parent {index} anchor"
+            sibling.text = f"parent {index} sibling expansion"
+            anchor.token_count = 100
+            sibling.token_count = 350
+            chunks.extend([anchor, sibling])
+            candidates.append(rag.Candidate(chunk_id=anchor.chunk_id, rerank_score=score))
+
+        chunks_by_id = {chunk.chunk_id: chunk for chunk in chunks}
+        chunks_by_parent = rag.build_chunks_by_parent(chunks)
+
+        with patch.object(rag, "CONTEXT_TOKEN_BUDGET", 900):
+            selected, truncation = rag.dynamic_truncate(
+                candidates,
+                chunks_by_id,
+                chunks_by_parent=chunks_by_parent,
+            )
+            context_packet = rag.assemble_context(
+                "budgeted parent expansion",
+                selected,
+                chunks_by_id,
+                {"enough": True, "reason": "pass"},
+                chunks_by_parent=chunks_by_parent,
+            )
+
+        selected_chunk_ids = [item.candidate.chunk_id for item in selected]
+        self.assertEqual(selected_chunk_ids, ["parent1-anchor", "parent2-anchor"])
+        self.assertEqual(truncation["budget_basis"], "expanded_parent_context_tokens")
+        self.assertEqual(truncation["token_total"], 900)
+        self.assertEqual(context_packet["estimated_token_total"], truncation["token_total"])
+        self.assertLessEqual(context_packet["estimated_token_total"], 900)
+        self.assertEqual(selected[0].expanded_from_chunk_ids, ["parent1-anchor", "parent1-sibling"])
+
     def test_external_reranker_can_replace_rule_score_ordering(self) -> None:
         first = make_chunk("first", "internal")
         first.text = "generic refund text"
@@ -230,6 +271,100 @@ class RetrievalPipelineEnhancementTest(unittest.TestCase):
         self.assertEqual(request_body["documents"][1]["id"], "second")
         self.assertEqual([item.chunk_id for item in ranked], ["second", "first"])
         self.assertEqual(ranked[0].reason, "external_reranker:bge-reranker-v2-m3")
+
+    def test_rerank_skips_without_configured_model_and_keeps_rrf_order(self) -> None:
+        first = make_chunk("first", "internal")
+        first.text = "generic refund text"
+        second = make_chunk("second", "internal")
+        second.text = "exact SKU-A17 no reason return policy"
+        candidates = {
+            "first": rag.Candidate(chunk_id="first", rrf_score=0.2, dense_rank=1),
+            "second": rag.Candidate(chunk_id="second", rrf_score=0.1, bm25_rank=1),
+        }
+        chunks_by_id = {"first": first, "second": second}
+
+        ranked = rag.rerank("SKU-A17 是否支持无理由退货？", candidates, chunks_by_id)
+
+        self.assertEqual([item.chunk_id for item in ranked], ["first", "second"])
+        self.assertEqual(ranked[0].rerank_score, ranked[0].rrf_score)
+        self.assertEqual(ranked[0].reason, "rerank_skipped:no_configured_model")
+
+    def test_rrf_only_truncate_uses_rank_budget_without_absolute_score_cutoffs(self) -> None:
+        first = make_chunk("first", "internal")
+        second = make_chunk("second", "internal")
+        candidates = [
+            rag.Candidate(chunk_id="first", rerank_score=0.032, rrf_score=0.032, bm25_rank=1),
+            rag.Candidate(chunk_id="second", rerank_score=0.016, rrf_score=0.016, bm25_rank=2),
+        ]
+        chunks_by_id = {"first": first, "second": second}
+
+        selected, truncation = rag.dynamic_truncate(candidates, chunks_by_id, score_policy="rrf_only")
+
+        self.assertEqual([item.candidate.chunk_id for item in selected], ["first", "second"])
+        self.assertEqual(truncation["score_policy"], "rrf_only")
+        self.assertIsNone(truncation["min_score"])
+        self.assertIsNone(truncation["gap_threshold"])
+        self.assertEqual(truncation["stop_reason"], "max_k_or_budget")
+
+    def test_rrf_only_sufficiency_requires_lexical_retrieval_signal(self) -> None:
+        chunk = make_chunk("dense-only", "internal")
+        chunk.terms = rag.tokenize("积分 提现")
+        candidate = rag.Candidate(
+            chunk_id=chunk.chunk_id,
+            dense_rank=1,
+            bm25_rank=None,
+            rerank_score=0.032,
+        )
+
+        result = rag.sufficiency_check(
+            "积分可以提现吗？",
+            [candidate],
+            {chunk.chunk_id: chunk},
+            score_policy="rrf_only",
+        )
+
+        self.assertFalse(result["enough"])
+        self.assertEqual(result["reason"], "rrf_only_missing_lexical_signal")
+
+    def test_rrf_only_sufficiency_passes_with_lexical_coverage(self) -> None:
+        chunk = make_chunk("bm25-hit", "internal")
+        chunk.terms = rag.tokenize("积分 提现")
+        candidate = rag.Candidate(
+            chunk_id=chunk.chunk_id,
+            dense_rank=2,
+            bm25_rank=1,
+            rerank_score=0.016,
+        )
+
+        result = rag.sufficiency_check(
+            "积分可以提现吗？",
+            [candidate],
+            {chunk.chunk_id: chunk},
+            score_policy="rrf_only",
+        )
+
+        self.assertTrue(result["enough"])
+        self.assertEqual(result["reason"], "pass")
+        self.assertEqual(result["lexical_coverage_ratio"], result["coverage_ratio"])
+
+    def test_external_reranker_error_skips_without_rule_fallback(self) -> None:
+        first = make_chunk("first", "internal")
+        first.text = "generic refund text"
+        second = make_chunk("second", "internal")
+        second.text = "exact SKU-A17 no reason return policy"
+        candidates = {
+            "first": rag.Candidate(chunk_id="first", rrf_score=0.2, dense_rank=1),
+            "second": rag.Candidate(chunk_id="second", rrf_score=0.1, bm25_rank=1),
+        }
+        chunks_by_id = {"first": first, "second": second}
+        external = rag.make_external_reranker("http://reranker.test/rerank", model="bge-reranker-v2-m3")
+
+        with patch.object(external, "score", side_effect=RuntimeError("service unavailable")):
+            ranked = rag.rerank("SKU-A17 是否支持无理由退货？", candidates, chunks_by_id, external_reranker=external)
+
+        self.assertEqual([item.chunk_id for item in ranked], ["first", "second"])
+        self.assertEqual(external.last_error, "service unavailable")
+        self.assertEqual(ranked[0].reason, "rerank_skipped:reranker_error")
 
     def test_configured_reranker_uses_flagembedding_service_defaults(self) -> None:
         with patch.dict(
@@ -682,7 +817,12 @@ class CitationAndMonitoringTest(unittest.TestCase):
                 "answer": 17,
             },
             "selection_strategy": {"name": "mmr", "lambda": 0.72, "parent_expansion": True},
-            "reranker": {"mode": "rule", "fallback_used": False},
+            "reranker": {
+                "mode": "skipped",
+                "reason": "not_configured",
+                "fallback_used": False,
+                "score_policy": "rrf_only",
+            },
         }
 
         event = rag.build_monitoring_event(trace, latency_ms=123, status="ok")
@@ -701,7 +841,8 @@ class CitationAndMonitoringTest(unittest.TestCase):
         self.assertEqual(event["dedup_dropped_count"], 1)
         self.assertEqual(event["stage_latencies_ms"]["rerank"], 13)
         self.assertEqual(event["selection_strategy"], "mmr")
-        self.assertEqual(event["reranker_mode"], "rule")
+        self.assertEqual(event["reranker_mode"], "skipped")
+        self.assertEqual(event["reranker_score_policy"], "rrf_only")
         self.assertEqual(event["reranker_fallback_used"], False)
 
     def test_eval_cases_cover_practice_retrieval_and_permission_scenarios(self) -> None:
@@ -734,6 +875,32 @@ class CitationAndMonitoringTest(unittest.TestCase):
             self.assertEqual(rows[0]["trace_id"], trace["trace_id"])
             self.assertEqual(rows[0]["answer_mode"], "extractive")
             self.assertIn("monitoring_metrics_path", trace)
+
+    def test_run_query_records_skipped_rerank_when_model_is_not_configured(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            store_path = tmp_path / "indexes" / "rag.sqlite"
+            metrics_path = tmp_path / "metrics" / "online_metrics.jsonl"
+            with patch.dict(os.environ, {"RERANKER_PROVIDER": "", "RERANKER_URL": ""}, clear=False):
+                trace = rag.run_query(
+                    "会员积分可以提现吗？",
+                    quiet=True,
+                    rebuild_index=True,
+                    vector_backend="local",
+                    store_path=store_path,
+                    metrics_path=metrics_path,
+                )
+
+            self.assertEqual(trace["reranker"]["mode"], "skipped")
+            self.assertEqual(trace["reranker"]["reason"], "not_configured")
+            self.assertEqual(trace["reranker"]["score_policy"], "rrf_only")
+            self.assertEqual(trace["model_config"]["rerank_mode"], "skipped")
+            self.assertEqual(trace["model_config"]["rerank_score_policy"], "rrf_only")
+            self.assertEqual(trace["truncation"]["score_policy"], "rrf_only")
+            self.assertIsNone(trace["truncation"]["min_score"])
+            self.assertIsNone(trace["truncation"]["gap_threshold"])
+            self.assertEqual(trace["context_packet"]["sufficiency"]["score_policy"], "rrf_only")
+            self.assertFalse(trace["context_packet"]["sufficiency"]["score_confidence"])
 
 
 class DatasetImportTest(unittest.TestCase):
