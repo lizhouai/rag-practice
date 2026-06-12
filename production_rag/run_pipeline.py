@@ -36,7 +36,6 @@ DEFAULT_VECTOR_BACKEND = "qdrant"
 DEFAULT_QDRANT_URL = "http://localhost:6333"
 DEFAULT_QDRANT_COLLECTION = "production_rag_chunks"
 QDRANT_PAYLOAD_INDEXES = {"doc_id": "keyword"}
-DEFAULT_LOCAL_VECTOR_SIZE = 64
 
 CHUNK_CHARS = 280
 OVERLAP_CHARS = 60
@@ -348,6 +347,13 @@ def parse_int_env(name: str, default: int) -> int:
     return parsed
 
 
+def resolve_vector_dimensions() -> int:
+    # Single global vector dimension: real embeddings, local hash vectors, and
+    # the Qdrant collection all use this value so vectors stay comparable
+    # across every mode combination.
+    return parse_int_env("EMBEDDING_DIMENSIONS", DEFAULT_EMBEDDING_DIMENSIONS)
+
+
 def normalize_text(text: str) -> str:
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = re.sub(r"\n{3,}", "\n\n", text)
@@ -378,9 +384,14 @@ def safe_relative(path: Path, base: Path) -> str:
         return str(path)
 
 
-def content_hash(text: str, embedding_model: str) -> str:
+def content_hash(text: str, embedding_model: str, dimensions: int) -> str:
+    # Dimensions are part of the index identity: changing EMBEDDING_DIMENSIONS
+    # must re-embed every document, or stored vectors would no longer match
+    # query vectors.
     digest = hashlib.sha256()
     digest.update(embedding_model.encode("utf-8"))
+    digest.update(b"\0")
+    digest.update(str(dimensions).encode("utf-8"))
     digest.update(b"\0")
     digest.update(text.encode("utf-8"))
     return digest.hexdigest()
@@ -587,7 +598,7 @@ class QdrantVectorStore:
         self,
         base_url: str = DEFAULT_QDRANT_URL,
         collection_name: str = DEFAULT_QDRANT_COLLECTION,
-        vector_size: int = DEFAULT_LOCAL_VECTOR_SIZE,
+        vector_size: int = DEFAULT_EMBEDDING_DIMENSIONS,
         api_key: str | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
@@ -804,7 +815,8 @@ def tokenize(text: str) -> list[str]:
     return expanded
 
 
-def vectorize(tokens: list[str], dims: int = 64) -> list[float]:
+def vectorize(tokens: list[str], dims: int | None = None) -> list[float]:
+    dims = dims or resolve_vector_dimensions()
     vector = [0.0] * dims
     for token in tokens:
         digest = hashlib.sha256(token.encode("utf-8")).digest()
@@ -995,7 +1007,7 @@ def make_vector_store(
     vector_backend: str,
     *,
     store_path: Path = DEFAULT_VECTOR_DB_PATH,
-    vector_size: int = DEFAULT_LOCAL_VECTOR_SIZE,
+    vector_size: int = DEFAULT_EMBEDDING_DIMENSIONS,
 ) -> object:
     if vector_backend == "qdrant":
         return QdrantVectorStore(
@@ -1027,6 +1039,7 @@ def sync_index(
 ) -> dict:
     """Sync changed markdown documents into the configured vector store."""
     model_name = embedding_model or (DEFAULT_EMBEDDING_MODEL if embedder else LOCAL_EMBEDDING_MODEL)
+    dimensions = resolve_vector_dimensions()
     store = vector_store or LocalVectorStore(store_path)
     if rebuild:
         store.reset()
@@ -1046,7 +1059,7 @@ def sync_index(
         metadata.setdefault("effective_to", "")
         doc_id = metadata["doc_id"]
         current_doc_ids.add(doc_id)
-        hash_value = content_hash(raw_text, model_name)
+        hash_value = content_hash(raw_text, model_name, dimensions)
 
         existing = manifest.get(doc_id)
         if (
@@ -1081,8 +1094,7 @@ def sync_index(
     }
 
 
-def dense_recall(query: str, chunks: list[Chunk], top_n: int = DENSE_TOP_N) -> list[tuple[float, Chunk]]:
-    query_vector = vectorize(tokenize(query))
+def dense_recall(query_vector: list[float], chunks: list[Chunk], top_n: int = DENSE_TOP_N) -> list[tuple[float, Chunk]]:
     scored = [(cosine(query_vector, chunk.dense_vector), chunk) for chunk in chunks]
     return sorted(scored, key=lambda item: item[0], reverse=True)[:top_n]
 
@@ -1622,7 +1634,7 @@ def make_embedding_function(dimensions: int | None = None):
     if not api_key:
         raise RuntimeError("Missing embedding API key. Set EMBEDDING_API_KEY or ZHIPU_API_KEY.")
     client = OpenAICompatibleEmbeddingClient(api_key=api_key, base_url=resolve_embedding_base_url())
-    embedding_dimensions = dimensions or parse_int_env("EMBEDDING_DIMENSIONS", DEFAULT_EMBEDDING_DIMENSIONS)
+    embedding_dimensions = dimensions or resolve_vector_dimensions()
 
     def embed(texts: list[str]) -> list[list[float]]:
         vectors: list[list[float]] = []
@@ -1741,7 +1753,7 @@ def run_query(
         if real_models
         else LOCAL_EMBEDDING_MODEL
     )
-    vector_size = parse_int_env("EMBEDDING_DIMENSIONS", DEFAULT_EMBEDDING_DIMENSIONS) if real_models else DEFAULT_LOCAL_VECTOR_SIZE
+    vector_size = resolve_vector_dimensions()
     vector_store = make_vector_store(vector_backend, store_path=store_path, vector_size=vector_size)
     if hasattr(vector_store, "ensure_collection"):
         vector_store.ensure_collection()
@@ -1765,15 +1777,17 @@ def run_query(
     stage_latencies_ms["access_filter"] = int((time.perf_counter() - stage_started) * 1000)
 
     stage_started = time.perf_counter()
+    # The query vector must come from the same vectorizer (and dimensions) as
+    # the stored chunk vectors, regardless of which store serves the search.
+    query_vector = embedder([query])[0] if embedder else vectorize(tokenize(query))
     if vector_backend == "qdrant":
-        query_vector = embedder([query])[0] if embedder else vectorize(tokenize(query))
         dense_results = [
             (score, chunk)
             for score, chunk in vector_store.search(query_vector, DENSE_TOP_N)
             if chunk.chunk_id in chunks_by_id
         ]
     else:
-        dense_results = dense_recall(query, chunks)
+        dense_results = dense_recall(query_vector, chunks)
     stage_latencies_ms["dense_recall"] = int((time.perf_counter() - stage_started) * 1000)
 
     stage_started = time.perf_counter()
@@ -1839,6 +1853,7 @@ def run_query(
             "llm_base_url": resolve_llm_base_url() if real_models else "offline_extractive",
             "embedding_model": embedding_model,
             "embedding_base_url": resolve_embedding_base_url() if real_models else "offline_hash",
+            "vector_dimensions": vector_size,
             "rerank_mode": "local_cross_encoder_style",
             "vector_backend": vector_backend,
             "qdrant_url": resolve_qdrant_url() if vector_backend == "qdrant" else "",

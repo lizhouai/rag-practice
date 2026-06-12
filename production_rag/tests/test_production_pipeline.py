@@ -47,6 +47,35 @@ class ProductionDefaultsTest(unittest.TestCase):
         self.assertEqual(rag.DEFAULT_QDRANT_COLLECTION, "production_rag_chunks")
 
 
+class VectorDimensionConsistencyTest(unittest.TestCase):
+    def test_hash_vectorize_follows_global_embedding_dimensions(self) -> None:
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("EMBEDDING_DIMENSIONS", None)
+            self.assertEqual(rag.DEFAULT_EMBEDDING_DIMENSIONS, 1024)
+            self.assertEqual(len(rag.vectorize(["alpha", "beta"])), 1024)
+        with patch.dict(os.environ, {"EMBEDDING_DIMENSIONS": "256"}, clear=False):
+            self.assertEqual(rag.resolve_vector_dimensions(), 256)
+            self.assertEqual(len(rag.vectorize(["alpha", "beta"])), 256)
+
+    def test_content_hash_changes_when_dimensions_change(self) -> None:
+        self.assertNotEqual(
+            rag.content_hash("same text", "embedding-3", 1024),
+            rag.content_hash("same text", "embedding-3", 256),
+        )
+
+    def test_dense_recall_scores_with_provided_query_vector(self) -> None:
+        matching = make_chunk("matching", "internal")
+        matching.dense_vector = [1.0, 0.0]
+        other = make_chunk("other", "internal")
+        other.dense_vector = [0.0, 1.0]
+
+        results = rag.dense_recall([1.0, 0.0], [matching, other], top_n=2)
+
+        self.assertEqual(results[0][1].chunk_id, "matching")
+        self.assertAlmostEqual(results[0][0], 1.0)
+        self.assertAlmostEqual(results[1][0], 0.0)
+
+
 class PermissionFilterTest(unittest.TestCase):
     def test_filter_chunks_for_access_removes_out_of_scope_and_expired_docs(self) -> None:
         chunks = [
