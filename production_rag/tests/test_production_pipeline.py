@@ -1105,6 +1105,7 @@ class QdrantVectorStoreTest(unittest.TestCase):
                                     "id": rag.stable_point_id(chunk.chunk_id),
                                     "score": 0.87,
                                     "payload": payload,
+                                    "vector": {"dense": [0.5, 0.6]},
                                 }
                             ]
                         }
@@ -1133,10 +1134,10 @@ class QdrantVectorStoreTest(unittest.TestCase):
         self.assertEqual(body["query"], [0.1, 0.2])
         self.assertEqual(body["using"], "dense")
         self.assertEqual(body["limit"], 3)
-        self.assertEqual(body["with_vector"], False)
+        self.assertEqual(body["with_vector"], [rag.QDRANT_DENSE_VECTOR_NAME])
         self.assertEqual(results[0][0], 0.87)
         self.assertEqual(results[0][1].chunk_id, "chunk-1")
-        self.assertEqual(results[0][1].dense_vector, [])
+        self.assertEqual(results[0][1].dense_vector, [0.5, 0.6])
 
     def test_bm25_search_uses_qdrant_sparse_vector_query(self) -> None:
         chunk = make_chunk("chunk-1", "internal")
@@ -1164,6 +1165,7 @@ class QdrantVectorStoreTest(unittest.TestCase):
                                     "id": rag.stable_point_id(chunk.chunk_id),
                                     "score": 4.2,
                                     "payload": payload,
+                                    "vector": {"dense": [0.3, 0.4]},
                                 }
                             ]
                         }
@@ -1192,10 +1194,154 @@ class QdrantVectorStoreTest(unittest.TestCase):
         self.assertEqual(body["query"], rag.qdrant_sparse_vector_from_terms(rag.tokenize("refund timeline")))
         self.assertEqual(body["using"], "bm25")
         self.assertEqual(body["limit"], 3)
-        self.assertEqual(body["with_vector"], False)
+        self.assertEqual(body["with_vector"], [rag.QDRANT_DENSE_VECTOR_NAME])
         self.assertEqual(body["filter"], rag.qdrant_access_filter({"internal"}, "2026-06-07"))
         self.assertEqual(results[0][0], 4.2)
         self.assertEqual(results[0][1].chunk_id, "chunk-1")
+        self.assertEqual(results[0][1].dense_vector, [0.3, 0.4])
+
+    @staticmethod
+    def classify_scroll_filter(access_filter: dict) -> str:
+        rendered = json.dumps(access_filter)
+        if "must_not" in access_filter:
+            return "permission_blocked"
+        if '"gt"' in rendered:
+            return "not_yet_effective"
+        if '"lt"' in rendered:
+            return "expired"
+        return "visible"
+
+    def test_load_access_chunks_scrolls_all_categories_without_vectors(self) -> None:
+        visible_payload = rag.chunk_to_qdrant_payload(
+            make_chunk("chunk-visible", "internal"),
+            source_path="data/raw/doc.md",
+            content_hash="hash-1",
+            embedding_model="embedding-3",
+        )
+        blocked_payload = rag.chunk_to_qdrant_payload(
+            make_chunk("chunk-blocked", "finance_restricted"),
+            source_path="data/raw/doc.md",
+            content_hash="hash-2",
+            embedding_model="embedding-3",
+        )
+        expired_payload = rag.chunk_to_qdrant_payload(
+            make_chunk("chunk-expired", "internal", effective_to="2025-01-01"),
+            source_path="data/raw/doc.md",
+            content_hash="hash-3",
+            embedding_model="embedding-3",
+        )
+        points_by_category = {
+            "visible": [{"id": 1, "payload": visible_payload}],
+            "permission_blocked": [{"id": 2, "payload": blocked_payload}],
+            "not_yet_effective": [],
+            "expired": [{"id": 3, "payload": expired_payload}],
+        }
+        scroll_bodies: list[dict] = []
+
+        def fake_request_json(
+            method: str,
+            url: str,
+            body: dict[str, object] | None = None,
+            headers: dict[str, str] | None = None,
+            ok_statuses: tuple[int, ...] = (200,),
+        ) -> dict:
+            assert url.endswith("/points/scroll"), f"unexpected request {method} {url}"
+            scroll_bodies.append(body)
+            category = self.classify_scroll_filter(body["filter"])
+            return {"result": {"points": points_by_category[category], "next_page_offset": None}}
+
+        store = rag.QdrantVectorStore(
+            base_url="http://qdrant.test",
+            collection_name="rag_test",
+            vector_size=64,
+        )
+        with patch.object(rag, "request_json", fake_request_json):
+            visible, rejected, blocked = store.load_access_chunks({"internal"}, today="2026-06-07")
+
+        self.assertEqual(len(scroll_bodies), 4)
+        for body in scroll_bodies:
+            self.assertEqual(body["with_vector"], False)
+        self.assertEqual([chunk.chunk_id for chunk in visible], ["chunk-visible"])
+        self.assertEqual([chunk.chunk_id for chunk in blocked], ["chunk-blocked"])
+        self.assertEqual(
+            {(item["chunk_id"], item["reason"]) for item in rejected},
+            {("chunk-blocked", "permission_scope"), ("chunk-expired", "expired")},
+        )
+
+    def test_run_query_qdrant_recall_vectors_feed_mmr_dedup(self) -> None:
+        chunk_a = make_chunk("chunk-a", "internal")
+        chunk_b = make_chunk("chunk-b", "internal")
+        payloads = {
+            chunk.chunk_id: rag.chunk_to_qdrant_payload(
+                chunk,
+                source_path="data/raw/doc.md",
+                content_hash=f"hash-{chunk.chunk_id}",
+                embedding_model="embedding-3",
+            )
+            for chunk in (chunk_a, chunk_b)
+        }
+        shared_vector = [1.0, 0.0]
+
+        def fake_request_json(
+            method: str,
+            url: str,
+            body: dict[str, object] | None = None,
+            headers: dict[str, str] | None = None,
+            ok_statuses: tuple[int, ...] = (200,),
+        ) -> dict:
+            if method == "GET" and url.endswith("/collections/rag_test"):
+                return {
+                    "result": {
+                        "payload_schema": {name: {} for name in rag.QDRANT_PAYLOAD_INDEXES},
+                        "config": {"params": {"sparse_vectors": {rag.QDRANT_BM25_VECTOR_NAME: {}}}},
+                    }
+                }
+            if url.endswith("/points/scroll"):
+                category = self.classify_scroll_filter(body["filter"])
+                if category == "visible":
+                    # The access snapshot deliberately carries no vectors; MMR must
+                    # get them from the recall responses below.
+                    points = [{"id": 1, "payload": payloads["chunk-a"]}, {"id": 2, "payload": payloads["chunk-b"]}]
+                else:
+                    points = []
+                return {"result": {"points": points, "next_page_offset": None}}
+            if url.endswith("/points/query") and body["using"] == rag.QDRANT_DENSE_VECTOR_NAME:
+                return {
+                    "result": {
+                        "points": [
+                            {"id": 1, "score": 0.9, "payload": payloads["chunk-a"], "vector": {"dense": shared_vector}},
+                            {"id": 2, "score": 0.8, "payload": payloads["chunk-b"], "vector": {"dense": shared_vector}},
+                        ]
+                    }
+                }
+            if url.endswith("/points/query") and body["using"] == rag.QDRANT_BM25_VECTOR_NAME:
+                return {"result": {"points": []}}
+            raise AssertionError(f"unexpected request {method} {url}")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            with (
+                patch.dict(
+                    os.environ,
+                    {"QDRANT_URL": "http://qdrant.test", "QDRANT_COLLECTION": "rag_test"},
+                    clear=True,
+                ),
+                patch.object(rag, "request_json", fake_request_json),
+            ):
+                trace = rag.run_query(
+                    "chunk test text",
+                    quiet=True,
+                    vector_backend="qdrant",
+                    store_path=tmp_path / "rag.sqlite",
+                    metrics_path=tmp_path / "metrics.jsonl",
+                )
+
+        self.assertEqual(trace["component_status"]["vector_store"]["backend"], "qdrant")
+        self.assertFalse(trace["component_status"]["vector_store"]["fallback_used"])
+        self.assertEqual(
+            [(item["chunk_id"], item["reason"]) for item in trace["dedup_dropped"]],
+            [("chunk-b", "near_duplicate")],
+        )
 
 
 class ProviderClientTest(unittest.TestCase):

@@ -14,6 +14,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
@@ -1221,19 +1222,27 @@ class QdrantVectorStore:
         *,
         today: str | None = None,
     ) -> tuple[list[Chunk], list[dict], list[Chunk]]:
-        visible = self.load_chunks(access_filter=qdrant_access_filter(allowed_scopes, today), with_vector=True)
-        permission_blocked = self.load_chunks(
-            access_filter=qdrant_permission_blocked_filter(allowed_scopes, today),
-            with_vector=False,
-        )
-        not_yet_effective = self.load_chunks(
-            access_filter=qdrant_not_yet_effective_filter(allowed_scopes, today),
-            with_vector=False,
-        )
-        expired = self.load_chunks(
-            access_filter=qdrant_expired_filter(allowed_scopes, today),
-            with_vector=False,
-        )
+        # Dense vectors for retrieval candidates come back with the search/bm25
+        # responses, so even the visible scroll can skip vector payloads here.
+        # The four category scrolls are independent reads; running them
+        # concurrently pays one round trip of latency instead of four, which
+        # matters against a remote Qdrant.
+        filters = {
+            "visible": qdrant_access_filter(allowed_scopes, today),
+            "permission_blocked": qdrant_permission_blocked_filter(allowed_scopes, today),
+            "not_yet_effective": qdrant_not_yet_effective_filter(allowed_scopes, today),
+            "expired": qdrant_expired_filter(allowed_scopes, today),
+        }
+        with ThreadPoolExecutor(max_workers=len(filters)) as executor:
+            futures = {
+                name: executor.submit(self.load_chunks, access_filter=access_filter, with_vector=False)
+                for name, access_filter in filters.items()
+            }
+            loaded = {name: future.result() for name, future in futures.items()}
+        visible = loaded["visible"]
+        permission_blocked = loaded["permission_blocked"]
+        not_yet_effective = loaded["not_yet_effective"]
+        expired = loaded["expired"]
         rejected = [
             {"chunk_id": chunk.chunk_id, "doc_id": chunk.doc_id, "reason": "permission_scope"}
             for chunk in permission_blocked
@@ -1287,7 +1296,7 @@ class QdrantVectorStore:
             "using": QDRANT_DENSE_VECTOR_NAME,
             "limit": top_n,
             "with_payload": True,
-            "with_vector": False,
+            "with_vector": [QDRANT_DENSE_VECTOR_NAME],
         }
         if access_filter is not None:
             body["filter"] = access_filter
@@ -1307,6 +1316,7 @@ class QdrantVectorStore:
                     float(point.get("score", 0.0)),
                     chunk_from_qdrant_payload(
                         point.get("payload", {}),
+                        vector=qdrant_point_dense_vector(point.get("vector") or []),
                     ),
                 )
             )
@@ -1328,7 +1338,7 @@ class QdrantVectorStore:
             "using": QDRANT_BM25_VECTOR_NAME,
             "limit": top_n,
             "with_payload": True,
-            "with_vector": False,
+            "with_vector": [QDRANT_DENSE_VECTOR_NAME],
             "filter": qdrant_access_filter(allowed_scopes, today),
         }
         payload = request_json(
@@ -1342,7 +1352,15 @@ class QdrantVectorStore:
         points = result.get("points", result) if isinstance(result, dict) else result
         scored: list[tuple[float, Chunk]] = []
         for point in points or []:
-            scored.append((float(point.get("score", 0.0)), chunk_from_qdrant_payload(point.get("payload", {}))))
+            scored.append(
+                (
+                    float(point.get("score", 0.0)),
+                    chunk_from_qdrant_payload(
+                        point.get("payload", {}),
+                        vector=qdrant_point_dense_vector(point.get("vector") or []),
+                    ),
+                )
+            )
         return scored
 
 
@@ -2965,6 +2983,12 @@ def run_query(
     stage_latencies_ms["bm25_recall"] = int((time.perf_counter() - stage_started) * 1000)
     for _, chunk in bm25_results:
         chunks_by_id.setdefault(chunk.chunk_id, chunk)
+    # The qdrant access snapshot is loaded without vectors; recall results carry
+    # the dense vectors MMR needs, so backfill them onto the shared chunks.
+    for _, chunk in [*dense_results, *bm25_results]:
+        stored = chunks_by_id.get(chunk.chunk_id)
+        if stored is not None and not stored.dense_vector and chunk.dense_vector:
+            stored.dense_vector = chunk.dense_vector
     chunks_by_parent = build_chunks_by_parent(list(chunks_by_id.values()))
 
     stage_started = time.perf_counter()
