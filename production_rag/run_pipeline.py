@@ -35,7 +35,12 @@ METRICS_PATH = TRACE_DIR / "online_metrics.jsonl"
 DEFAULT_VECTOR_BACKEND = "qdrant"
 DEFAULT_QDRANT_URL = "http://localhost:6333"
 DEFAULT_QDRANT_COLLECTION = "production_rag_chunks"
-QDRANT_PAYLOAD_INDEXES = {"doc_id": "keyword"}
+QDRANT_PAYLOAD_INDEXES = {
+    "doc_id": "keyword",
+    "permission_scopes": "keyword",
+    "effective_from_day": "integer",
+    "effective_to_day": "integer",
+}
 
 CHUNK_CHARS = 280
 OVERLAP_CHARS = 60
@@ -500,6 +505,39 @@ def local_store_path_for_embedding_identity(store_path: Path, identity: str) -> 
     return store_path.with_name(f"{store_path.stem}.{slug}.{digest}{store_path.suffix}")
 
 
+def date_to_sortable_day(value: str | None, *, default: int) -> int:
+    text = (value or "").strip()
+    if not text:
+        return default
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+        return int(text.replace("-", ""))
+    digits = re.sub(r"\D", "", text)
+    if len(digits) >= 8:
+        return int(digits[:8])
+    return default
+
+
+def metadata_access_fields(metadata: dict[str, str]) -> dict[str, int | str]:
+    effective_from = metadata.get("effective_from", "").strip()
+    effective_to = metadata.get("effective_to", "").strip()
+    return {
+        "permission_scope": metadata.get("permission_scope", "").strip(),
+        "effective_from": effective_from,
+        "effective_to": effective_to,
+        "effective_from_day": date_to_sortable_day(effective_from, default=0),
+        "effective_to_day": date_to_sortable_day(effective_to, default=99991231),
+    }
+
+
+def allowed_scope_key(allowed_scopes: set[str]) -> str:
+    return "\x1f".join(sorted(scope for scope in allowed_scopes if scope))
+
+
+def sqlite_fts_query(terms: list[str]) -> str:
+    quoted_terms = [f'"{term.replace(chr(34), chr(34) + chr(34))}"' for term in terms if term]
+    return " OR ".join(quoted_terms)
+
+
 class LocalVectorStore:
     def __init__(self, path: Path = DEFAULT_VECTOR_DB_PATH) -> None:
         self.path = path
@@ -512,6 +550,7 @@ class LocalVectorStore:
         connection = sqlite3.connect(self.path)
         connection.execute("PRAGMA journal_mode=WAL")
         self.ensure_schema(connection)
+        self.register_functions(connection)
         return connection
 
     @staticmethod
@@ -536,6 +575,11 @@ class LocalVectorStore:
                 title_path_json TEXT NOT NULL,
                 text TEXT NOT NULL,
                 metadata_json TEXT NOT NULL,
+                permission_scope TEXT NOT NULL DEFAULT '',
+                effective_from TEXT NOT NULL DEFAULT '',
+                effective_to TEXT NOT NULL DEFAULT '',
+                effective_from_day INTEGER NOT NULL DEFAULT 0,
+                effective_to_day INTEGER NOT NULL DEFAULT 99991231,
                 token_count INTEGER NOT NULL,
                 dense_vector_json TEXT NOT NULL,
                 terms_json TEXT NOT NULL
@@ -543,9 +587,83 @@ class LocalVectorStore:
             """
         )
         connection.execute("CREATE INDEX IF NOT EXISTS idx_chunks_doc_id ON chunks(doc_id)")
+        for column_name, column_type in {
+            "permission_scope": "TEXT NOT NULL DEFAULT ''",
+            "effective_from": "TEXT NOT NULL DEFAULT ''",
+            "effective_to": "TEXT NOT NULL DEFAULT ''",
+            "effective_from_day": "INTEGER NOT NULL DEFAULT 0",
+            "effective_to_day": "INTEGER NOT NULL DEFAULT 99991231",
+        }.items():
+            if not LocalVectorStore.column_exists(connection, "chunks", column_name):
+                connection.execute(f"ALTER TABLE chunks ADD COLUMN {column_name} {column_type}")
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_chunks_permission_scope ON chunks(permission_scope)")
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_chunks_effective_days ON chunks(effective_from_day, effective_to_day)")
+        connection.execute(
+            """
+            CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts
+            USING fts5(chunk_id UNINDEXED, terms_text)
+            """
+        )
+        LocalVectorStore.backfill_access_columns(connection)
+        LocalVectorStore.refresh_fts_index(connection)
+        connection.commit()
+
+    @staticmethod
+    def column_exists(connection: sqlite3.Connection, table_name: str, column_name: str) -> bool:
+        rows = connection.execute(f"PRAGMA table_info({table_name})").fetchall()
+        return any(row[1] == column_name for row in rows)
+
+    @staticmethod
+    def register_functions(connection: sqlite3.Connection) -> None:
+        def scope_allowed(scope_text: str | None, allowed_text: str | None) -> int:
+            scopes = split_metadata_values(scope_text or "")
+            allowed = {item for item in (allowed_text or "").split("\x1f") if item}
+            return int(bool(scopes and not scopes.isdisjoint(allowed)))
+
+        connection.create_function("scope_allowed", 2, scope_allowed)
+
+    @staticmethod
+    def backfill_access_columns(connection: sqlite3.Connection) -> None:
+        rows = connection.execute("SELECT chunk_id, metadata_json FROM chunks").fetchall()
+        for chunk_id, metadata_json in rows:
+            metadata = json.loads(metadata_json)
+            fields = metadata_access_fields(metadata)
+            connection.execute(
+                """
+                UPDATE chunks
+                SET permission_scope = ?,
+                    effective_from = ?,
+                    effective_to = ?,
+                    effective_from_day = ?,
+                    effective_to_day = ?
+                WHERE chunk_id = ?
+                """,
+                (
+                    fields["permission_scope"],
+                    fields["effective_from"],
+                    fields["effective_to"],
+                    fields["effective_from_day"],
+                    fields["effective_to_day"],
+                    chunk_id,
+                ),
+            )
+
+    @staticmethod
+    def refresh_fts_index(connection: sqlite3.Connection) -> None:
+        chunk_count = connection.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+        fts_count = connection.execute("SELECT COUNT(*) FROM chunks_fts").fetchone()[0]
+        if chunk_count == fts_count:
+            return
+        rows = connection.execute("SELECT chunk_id, terms_json FROM chunks").fetchall()
+        connection.execute("DELETE FROM chunks_fts")
+        connection.executemany(
+            "INSERT INTO chunks_fts(chunk_id, terms_text) VALUES (?, ?)",
+            [(row[0], " ".join(json.loads(row[1]))) for row in rows],
+        )
 
     def reset(self) -> None:
         with closing(self.connect()) as connection:
+            connection.execute("DELETE FROM chunks_fts")
             connection.execute("DELETE FROM chunks")
             connection.execute("DELETE FROM documents")
             connection.commit()
@@ -575,6 +693,10 @@ class LocalVectorStore:
     ) -> None:
         now = datetime.now().isoformat(timespec="seconds")
         with closing(self.connect()) as connection:
+            connection.execute(
+                "DELETE FROM chunks_fts WHERE chunk_id IN (SELECT chunk_id FROM chunks WHERE doc_id = ?)",
+                (doc_id,),
+            )
             connection.execute("DELETE FROM chunks WHERE doc_id = ?", (doc_id,))
             connection.execute(
                 """
@@ -592,9 +714,10 @@ class LocalVectorStore:
                 """
                 INSERT INTO chunks(
                     chunk_id, parent_id, doc_id, title_path_json, text, metadata_json,
+                    permission_scope, effective_from, effective_to, effective_from_day, effective_to_day,
                     token_count, dense_vector_json, terms_json
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     (
@@ -604,12 +727,21 @@ class LocalVectorStore:
                         json.dumps(chunk.title_path, ensure_ascii=False),
                         chunk.text,
                         json.dumps(chunk.metadata, ensure_ascii=False),
+                        metadata_access_fields(chunk.metadata)["permission_scope"],
+                        metadata_access_fields(chunk.metadata)["effective_from"],
+                        metadata_access_fields(chunk.metadata)["effective_to"],
+                        metadata_access_fields(chunk.metadata)["effective_from_day"],
+                        metadata_access_fields(chunk.metadata)["effective_to_day"],
                         chunk.token_count,
                         json.dumps(chunk.dense_vector, ensure_ascii=False),
                         json.dumps(chunk.terms, ensure_ascii=False),
                     )
                     for chunk in chunks
                 ],
+            )
+            connection.executemany(
+                "INSERT INTO chunks_fts(chunk_id, terms_text) VALUES (?, ?)",
+                [(chunk.chunk_id, " ".join(chunk.terms)) for chunk in chunks],
             )
             connection.commit()
 
@@ -618,6 +750,10 @@ class LocalVectorStore:
             return
         with closing(self.connect()) as connection:
             for doc_id in sorted(doc_ids):
+                connection.execute(
+                    "DELETE FROM chunks_fts WHERE chunk_id IN (SELECT chunk_id FROM chunks WHERE doc_id = ?)",
+                    (doc_id,),
+                )
                 connection.execute("DELETE FROM chunks WHERE doc_id = ?", (doc_id,))
                 connection.execute("DELETE FROM documents WHERE doc_id = ?", (doc_id,))
             connection.commit()
@@ -632,20 +768,125 @@ class LocalVectorStore:
                 ORDER BY doc_id, chunk_id
                 """
             ).fetchall()
-        return [
-            Chunk(
-                chunk_id=row[0],
-                parent_id=row[1],
-                doc_id=row[2],
-                title_path=json.loads(row[3]),
-                text=row[4],
-                metadata=json.loads(row[5]),
-                token_count=row[6],
-                dense_vector=json.loads(row[7]),
-                terms=json.loads(row[8]),
+        return [self.chunk_from_sql_row(row) for row in rows]
+
+    def load_access_chunks(
+        self,
+        allowed_scopes: set[str],
+        *,
+        today: str | None = None,
+    ) -> tuple[list[Chunk], list[dict], list[Chunk]]:
+        today_day = date_to_sortable_day(today or datetime.now().date().isoformat(), default=0)
+        scope_key = allowed_scope_key(allowed_scopes)
+        with closing(self.connect()) as connection:
+            visible = self.fetch_chunks(
+                connection,
+                """
+                scope_allowed(c.permission_scope, ?) = 1
+                AND c.effective_from_day <= ?
+                AND c.effective_to_day >= ?
+                """,
+                (scope_key, today_day, today_day),
             )
-            for row in rows
+            permission_blocked = self.fetch_chunks(
+                connection,
+                "scope_allowed(c.permission_scope, ?) = 0",
+                (scope_key,),
+            )
+            time_rejected_rows = connection.execute(
+                """
+                SELECT c.chunk_id, c.doc_id, c.effective_from_day, c.effective_to_day
+                FROM chunks c
+                WHERE scope_allowed(c.permission_scope, ?) = 1
+                  AND (c.effective_from_day > ? OR c.effective_to_day < ?)
+                ORDER BY c.doc_id, c.chunk_id
+                """,
+                (scope_key, today_day, today_day),
+            ).fetchall()
+        rejected = [
+            {"chunk_id": chunk.chunk_id, "doc_id": chunk.doc_id, "reason": "permission_scope"}
+            for chunk in permission_blocked
         ]
+        for chunk_id, doc_id, effective_from_day, effective_to_day in time_rejected_rows:
+            reason = "not_yet_effective" if effective_from_day > today_day else "expired"
+            rejected.append({"chunk_id": chunk_id, "doc_id": doc_id, "reason": reason})
+        return visible, rejected, permission_blocked
+
+    def bm25_search(
+        self,
+        query: str,
+        allowed_scopes: set[str],
+        *,
+        top_n: int = BM25_TOP_N,
+        today: str | None = None,
+    ) -> list[tuple[float, Chunk]]:
+        fts_query = sqlite_fts_query(tokenize(query))
+        if not fts_query:
+            return []
+        today_day = date_to_sortable_day(today or datetime.now().date().isoformat(), default=0)
+        scope_key = allowed_scope_key(allowed_scopes)
+        try:
+            with closing(self.connect()) as connection:
+                rows = connection.execute(
+                    f"""
+                    SELECT {self.chunk_select_columns("c")}, bm25(chunks_fts) AS rank
+                    FROM chunks_fts
+                    JOIN chunks c ON c.chunk_id = chunks_fts.chunk_id
+                    WHERE chunks_fts MATCH ?
+                      AND scope_allowed(c.permission_scope, ?) = 1
+                      AND c.effective_from_day <= ?
+                      AND c.effective_to_day >= ?
+                    ORDER BY rank ASC
+                    LIMIT ?
+                    """,
+                    (fts_query, scope_key, today_day, today_day, top_n),
+                ).fetchall()
+        except sqlite3.OperationalError:
+            return []
+        return [(-float(row[9]), self.chunk_from_sql_row(row)) for row in rows]
+
+    def chunks_count(self) -> int:
+        with closing(self.connect()) as connection:
+            return int(connection.execute("SELECT COUNT(*) FROM chunks").fetchone()[0])
+
+    @staticmethod
+    def chunk_select_columns(alias: str) -> str:
+        return (
+            f"{alias}.chunk_id, {alias}.parent_id, {alias}.doc_id, {alias}.title_path_json, "
+            f"{alias}.text, {alias}.metadata_json, {alias}.token_count, "
+            f"{alias}.dense_vector_json, {alias}.terms_json"
+        )
+
+    @staticmethod
+    def chunk_from_sql_row(row: tuple) -> Chunk:
+        return Chunk(
+            chunk_id=row[0],
+            parent_id=row[1],
+            doc_id=row[2],
+            title_path=json.loads(row[3]),
+            text=row[4],
+            metadata=json.loads(row[5]),
+            token_count=row[6],
+            dense_vector=json.loads(row[7]),
+            terms=json.loads(row[8]),
+        )
+
+    def fetch_chunks(
+        self,
+        connection: sqlite3.Connection,
+        where_clause: str,
+        params: tuple,
+    ) -> list[Chunk]:
+        rows = connection.execute(
+            f"""
+            SELECT {self.chunk_select_columns("c")}
+            FROM chunks c
+            WHERE {where_clause}
+            ORDER BY c.doc_id, c.chunk_id
+            """,
+            params,
+        ).fetchall()
+        return [self.chunk_from_sql_row(row) for row in rows]
 
 
 def stable_point_id(value: str) -> str:
@@ -663,6 +904,7 @@ def chunk_to_qdrant_payload(
     metadata = dict(chunk.metadata)
     metadata.setdefault("source_path", source_path)
     resolved_doc_id = doc_id or chunk.doc_id
+    access_fields = metadata_access_fields(metadata)
     return {
         "chunk_id": chunk.chunk_id,
         "parent_id": chunk.parent_id,
@@ -670,6 +912,12 @@ def chunk_to_qdrant_payload(
         "title_path": chunk.title_path,
         "text": chunk.text,
         "metadata": metadata,
+        "permission_scope": access_fields["permission_scope"],
+        "permission_scopes": sorted(split_metadata_values(str(access_fields["permission_scope"]))),
+        "effective_from": access_fields["effective_from"],
+        "effective_to": access_fields["effective_to"],
+        "effective_from_day": access_fields["effective_from_day"],
+        "effective_to_day": access_fields["effective_to_day"],
         "token_count": chunk.token_count,
         "terms": chunk.terms,
         "source_path": source_path,
@@ -694,6 +942,55 @@ def chunk_from_qdrant_payload(payload: dict, vector: list[float] | None = None) 
 
 def qdrant_filter_by_doc_id(doc_id: str) -> dict:
     return {"must": [{"key": "doc_id", "match": {"value": doc_id}}]}
+
+
+def qdrant_scope_filter(allowed_scopes: set[str]) -> dict:
+    scopes = sorted(scope for scope in allowed_scopes if scope)
+    if not scopes:
+        return {"must": [{"key": "__empty_scope__", "match": {"value": "__never__"}}]}
+    return {"should": [{"key": "permission_scopes", "match": {"value": scope}} for scope in scopes]}
+
+
+def qdrant_effective_filter(today: str | None = None) -> list[dict]:
+    today_day = date_to_sortable_day(today or datetime.now().date().isoformat(), default=0)
+    return [
+        {"key": "effective_from_day", "range": {"lte": today_day}},
+        {"key": "effective_to_day", "range": {"gte": today_day}},
+    ]
+
+
+def qdrant_access_filter(allowed_scopes: set[str], today: str | None = None) -> dict:
+    return {
+        "must": [qdrant_scope_filter(allowed_scopes), *qdrant_effective_filter(today)],
+    }
+
+
+def qdrant_permission_blocked_filter(allowed_scopes: set[str], today: str | None = None) -> dict:
+    scopes = sorted(scope for scope in allowed_scopes if scope)
+    return {
+        "must": qdrant_effective_filter(today),
+        "must_not": [{"key": "permission_scopes", "match": {"value": scope}} for scope in scopes],
+    }
+
+
+def qdrant_not_yet_effective_filter(allowed_scopes: set[str], today: str | None = None) -> dict:
+    today_day = date_to_sortable_day(today or datetime.now().date().isoformat(), default=0)
+    return {
+        "must": [
+            qdrant_scope_filter(allowed_scopes),
+            {"key": "effective_from_day", "range": {"gt": today_day}},
+        ],
+    }
+
+
+def qdrant_expired_filter(allowed_scopes: set[str], today: str | None = None) -> dict:
+    today_day = date_to_sortable_day(today or datetime.now().date().isoformat(), default=0)
+    return {
+        "must": [
+            qdrant_scope_filter(allowed_scopes),
+            {"key": "effective_to_day", "range": {"lt": today_day}},
+        ],
+    }
 
 
 class QdrantVectorStore:
@@ -843,15 +1140,48 @@ class QdrantVectorStore:
                 ok_statuses=(200,),
             )
 
-    def load_chunks(self) -> list[Chunk]:
+    def load_chunks(self, *, access_filter: dict | None = None, with_vector: bool = True) -> list[Chunk]:
         chunks: list[Chunk] = []
-        for point in self.scroll_points(with_vector=True):
+        for point in self.scroll_points(with_vector=with_vector, access_filter=access_filter):
             payload = point.get("payload", {})
             vector = point.get("vector") or []
             chunks.append(chunk_from_qdrant_payload(payload, vector=vector))
         return sorted(chunks, key=lambda chunk: chunk.chunk_id)
 
-    def scroll_points(self, with_vector: bool) -> list[dict]:
+    def load_access_chunks(
+        self,
+        allowed_scopes: set[str],
+        *,
+        today: str | None = None,
+    ) -> tuple[list[Chunk], list[dict], list[Chunk]]:
+        visible = self.load_chunks(access_filter=qdrant_access_filter(allowed_scopes, today), with_vector=True)
+        permission_blocked = self.load_chunks(
+            access_filter=qdrant_permission_blocked_filter(allowed_scopes, today),
+            with_vector=False,
+        )
+        not_yet_effective = self.load_chunks(
+            access_filter=qdrant_not_yet_effective_filter(allowed_scopes, today),
+            with_vector=False,
+        )
+        expired = self.load_chunks(
+            access_filter=qdrant_expired_filter(allowed_scopes, today),
+            with_vector=False,
+        )
+        rejected = [
+            {"chunk_id": chunk.chunk_id, "doc_id": chunk.doc_id, "reason": "permission_scope"}
+            for chunk in permission_blocked
+        ]
+        rejected.extend(
+            {"chunk_id": chunk.chunk_id, "doc_id": chunk.doc_id, "reason": "not_yet_effective"}
+            for chunk in not_yet_effective
+        )
+        rejected.extend(
+            {"chunk_id": chunk.chunk_id, "doc_id": chunk.doc_id, "reason": "expired"}
+            for chunk in expired
+        )
+        return visible, rejected, permission_blocked
+
+    def scroll_points(self, with_vector: bool, access_filter: dict | None = None) -> list[dict]:
         points: list[dict] = []
         offset: object | None = None
         while True:
@@ -860,6 +1190,8 @@ class QdrantVectorStore:
                 "with_payload": True,
                 "with_vector": with_vector,
             }
+            if access_filter is not None:
+                body["filter"] = access_filter
             if offset is not None:
                 body["offset"] = offset
             payload = request_json(
@@ -876,16 +1208,25 @@ class QdrantVectorStore:
             if not offset:
                 return points
 
-    def search(self, query_vector: list[float], top_n: int = DENSE_TOP_N) -> list[tuple[float, Chunk]]:
+    def search(
+        self,
+        query_vector: list[float],
+        top_n: int = DENSE_TOP_N,
+        *,
+        access_filter: dict | None = None,
+    ) -> list[tuple[float, Chunk]]:
+        body: dict[str, object] = {
+            "query": query_vector,
+            "limit": top_n,
+            "with_payload": True,
+            "with_vector": False,
+        }
+        if access_filter is not None:
+            body["filter"] = access_filter
         payload = request_json(
             "POST",
             self.collection_url("/points/query"),
-            body={
-                "query": query_vector,
-                "limit": top_n,
-                "with_payload": True,
-                "with_vector": True,
-            },
+            body=body,
             headers=self.headers(),
             ok_statuses=(200,),
         )
@@ -898,11 +1239,44 @@ class QdrantVectorStore:
                     float(point.get("score", 0.0)),
                     chunk_from_qdrant_payload(
                         point.get("payload", {}),
-                        vector=point.get("vector") or [],
                     ),
                 )
             )
         return scored
+
+
+class MirroredVectorStore:
+    def __init__(self, primary: object, mirror: LocalVectorStore) -> None:
+        self.primary = primary
+        self.mirror = mirror
+
+    def describe(self) -> str:
+        return self.primary.describe() if hasattr(self.primary, "describe") else str(self.primary)
+
+    def reset(self) -> None:
+        self.primary.reset()
+        self.mirror.reset()
+
+    def load_manifest(self) -> dict[str, dict[str, str]]:
+        return self.primary.load_manifest()
+
+    def upsert_document(
+        self,
+        doc_id: str,
+        source_path: str,
+        hash_value: str,
+        embedding_model: str,
+        chunks: list[Chunk],
+    ) -> None:
+        self.primary.upsert_document(doc_id, source_path, hash_value, embedding_model, chunks)
+        self.mirror.upsert_document(doc_id, source_path, hash_value, embedding_model, chunks)
+
+    def delete_documents(self, doc_ids: set[str]) -> None:
+        self.primary.delete_documents(doc_ids)
+        self.mirror.delete_documents(doc_ids)
+
+    def load_chunks(self) -> list[Chunk]:
+        return self.primary.load_chunks()
 
 
 def tokenize(text: str) -> list[str]:
@@ -1187,6 +1561,29 @@ def initialize_vector_store_with_fallback(
     return vector_store, requested_backend
 
 
+def index_status_without_rebuild(
+    *,
+    vector_store: object,
+    store_path: Path,
+    embedding_model: str,
+    embedding_identity_value: str,
+    reason: str = "rebuild_not_requested",
+) -> dict:
+    chunks_count = 0
+    if hasattr(vector_store, "chunks_count"):
+        chunks_count = vector_store.chunks_count()
+    return {
+        "store": vector_store.describe() if hasattr(vector_store, "describe") else str(store_path),
+        "embedding_model": embedding_model,
+        "embedding_identity": embedding_identity_value,
+        "changed_docs": [],
+        "removed_docs": [],
+        "chunks_count": chunks_count,
+        "rebuild_requested": False,
+        "reason": reason,
+    }
+
+
 def sync_index_with_store_fallback(
     *,
     vector_store: object,
@@ -1200,12 +1597,17 @@ def sync_index_with_store_fallback(
     embedding_identity_value: str | None = None,
 ) -> tuple[dict, object, str]:
     attempts = DEFAULT_RETRY_ATTEMPTS if resolved_backend == "qdrant" else 1
+    sync_store = (
+        MirroredVectorStore(vector_store, LocalVectorStore(store_path))
+        if resolved_backend == "qdrant"
+        else vector_store
+    )
     try:
         index_sync, used_attempts = call_with_retries(
             lambda: sync_index(
                 raw_dir,
                 store_path,
-                vector_store=vector_store,
+                vector_store=sync_store,
                 embedder=embedder,
                 rebuild=rebuild,
                 embedding_model=embedding_model,
@@ -1309,6 +1711,8 @@ def sync_index(
         "changed_docs": changed_docs,
         "removed_docs": sorted(removed_docs),
         "chunks_count": len(store.load_chunks()),
+        "rebuild_requested": rebuild,
+        "reason": "rebuilt" if rebuild else "incremental_sync",
     }
 
 
@@ -2187,6 +2591,7 @@ def run_query(
     embedding_model = embedding_status["model"]
     index_embedding_identity = embedding_status["identity"]
     active_store_path = local_store_path_for_embedding_identity(store_path, index_embedding_identity)
+    lexical_store = LocalVectorStore(active_store_path)
     query_vector: list[float] | None = None
     stage_started = time.perf_counter()
     try:
@@ -2208,6 +2613,7 @@ def run_query(
         embedding_model = LOCAL_EMBEDDING_MODEL
         index_embedding_identity = embedding_status["identity"]
         active_store_path = local_store_path_for_embedding_identity(store_path, index_embedding_identity)
+        lexical_store = LocalVectorStore(active_store_path)
         query_vector = vectorize(tokenize(query))
     stage_latencies_ms["embedding_probe"] = int((time.perf_counter() - stage_started) * 1000)
 
@@ -2221,83 +2627,93 @@ def run_query(
     stage_latencies_ms["vector_store_probe"] = int((time.perf_counter() - stage_started) * 1000)
 
     stage_started = time.perf_counter()
-    try:
-        index_sync, vector_store, resolved_vector_backend = sync_index_with_store_fallback(
+    if rebuild_index:
+        try:
+            index_sync, vector_store, resolved_vector_backend = sync_index_with_store_fallback(
+                vector_store=vector_store,
+                resolved_backend=resolved_vector_backend,
+                vector_status=vector_store_status,
+                store_path=active_store_path,
+                embedder=embedder,
+                rebuild=True,
+                embedding_model=embedding_model,
+                embedding_identity_value=index_embedding_identity,
+            )
+        except ComponentFallback as exc:
+            embedding_status.update(
+                {
+                    "mode": "hash_fallback",
+                    "provider": EMBEDDING_PROVIDER_LOCAL,
+                    "model": LOCAL_EMBEDDING_MODEL,
+                    "identity": embedding_identity(EMBEDDING_PROVIDER_LOCAL, LOCAL_EMBEDDING_MODEL),
+                    "fallback_used": True,
+                    "reason": exc.reason,
+                    "error": exc.error,
+                    "attempts": exc.attempts,
+                }
+            )
+            embedder = None
+            embedding_model = LOCAL_EMBEDDING_MODEL
+            index_embedding_identity = embedding_status["identity"]
+            active_store_path = local_store_path_for_embedding_identity(store_path, index_embedding_identity)
+            lexical_store = LocalVectorStore(active_store_path)
+            if resolved_vector_backend == "local":
+                vector_store = LocalVectorStore(active_store_path)
+            query_vector = vectorize(tokenize(query))
+            index_sync, vector_store, resolved_vector_backend = sync_index_with_store_fallback(
+                vector_store=vector_store,
+                resolved_backend=resolved_vector_backend,
+                vector_status=vector_store_status,
+                store_path=active_store_path,
+                embedder=embedder,
+                rebuild=True,
+                embedding_model=embedding_model,
+                embedding_identity_value=index_embedding_identity,
+            )
+    else:
+        index_sync = index_status_without_rebuild(
             vector_store=vector_store,
-            resolved_backend=resolved_vector_backend,
-            vector_status=vector_store_status,
             store_path=active_store_path,
-            embedder=embedder,
-            rebuild=rebuild_index,
-            embedding_model=embedding_model,
-            embedding_identity_value=index_embedding_identity,
-        )
-    except ComponentFallback as exc:
-        embedding_status.update(
-            {
-                "mode": "hash_fallback",
-                "provider": EMBEDDING_PROVIDER_LOCAL,
-                "model": LOCAL_EMBEDDING_MODEL,
-                "identity": embedding_identity(EMBEDDING_PROVIDER_LOCAL, LOCAL_EMBEDDING_MODEL),
-                "fallback_used": True,
-                "reason": exc.reason,
-                "error": exc.error,
-                "attempts": exc.attempts,
-            }
-        )
-        embedder = None
-        embedding_model = LOCAL_EMBEDDING_MODEL
-        index_embedding_identity = embedding_status["identity"]
-        active_store_path = local_store_path_for_embedding_identity(store_path, index_embedding_identity)
-        if resolved_vector_backend == "local":
-            vector_store = LocalVectorStore(active_store_path)
-        query_vector = vectorize(tokenize(query))
-        index_sync, vector_store, resolved_vector_backend = sync_index_with_store_fallback(
-            vector_store=vector_store,
-            resolved_backend=resolved_vector_backend,
-            vector_status=vector_store_status,
-            store_path=active_store_path,
-            embedder=embedder,
-            rebuild=rebuild_index,
             embedding_model=embedding_model,
             embedding_identity_value=index_embedding_identity,
         )
     stage_latencies_ms["index_sync"] = int((time.perf_counter() - stage_started) * 1000)
 
     def load_access_state():
-        nonlocal index_sync, resolved_vector_backend, vector_store
+        nonlocal index_sync, resolved_vector_backend, vector_store, lexical_store
 
-        def load_chunks() -> list[Chunk]:
+        def load_access_chunks() -> tuple[list[Chunk], list[dict], list[Chunk]]:
             if resolved_vector_backend == "qdrant":
-                loaded, attempts = call_with_retries(lambda: vector_store.load_chunks())
+                loaded, attempts = call_with_retries(lambda: vector_store.load_access_chunks(scopes))
                 vector_store_status["attempts"] = max(vector_store_status.get("attempts", 0), attempts)
                 return loaded
-            return vector_store.load_chunks()
+            return lexical_store.load_access_chunks(scopes)
 
         try:
-            loaded_chunks = load_chunks()
+            visible_chunks, rejected, permission_blocked_chunks = load_access_chunks()
         except RetryExhausted as exc:
             if resolved_vector_backend != "qdrant":
                 raise
             set_vector_store_fallback(vector_store_status, str(exc), exc.attempts)
-            vector_store = LocalVectorStore(active_store_path)
+            lexical_store = LocalVectorStore(active_store_path)
+            vector_store = lexical_store
             resolved_vector_backend = "local"
-            index_sync = sync_index(
-                RAW_DIR,
-                active_store_path,
-                vector_store=vector_store,
-                embedder=embedder,
-                rebuild=rebuild_index,
+            index_sync = index_status_without_rebuild(
+                vector_store=lexical_store,
+                store_path=active_store_path,
                 embedding_model=embedding_model,
                 embedding_identity_value=index_embedding_identity,
+                reason="qdrant_load_fallback",
             )
-            loaded_chunks = vector_store.load_chunks()
+            visible_chunks, rejected, permission_blocked_chunks = lexical_store.load_access_chunks(scopes)
 
-        visible_chunks, rejected = filter_chunks_for_access(loaded_chunks, scopes)
-        blocked_matches = find_permission_blocked_matches(query, loaded_chunks, rejected)
+        access_checked_chunks = visible_chunks + permission_blocked_chunks
+        blocked_matches = find_permission_blocked_matches(query, access_checked_chunks, rejected)
         visible_chunks_by_id = {chunk.chunk_id: chunk for chunk in visible_chunks}
+        if not index_sync.get("chunks_count"):
+            index_sync["chunks_count"] = len(visible_chunks)
         return (
-            loaded_chunks,
+            access_checked_chunks,
             visible_chunks,
             rejected,
             blocked_matches,
@@ -2340,18 +2756,28 @@ def run_query(
         embedding_model = LOCAL_EMBEDDING_MODEL
         index_embedding_identity = embedding_status["identity"]
         active_store_path = local_store_path_for_embedding_identity(store_path, index_embedding_identity)
+        lexical_store = LocalVectorStore(active_store_path)
         if resolved_vector_backend == "local":
-            vector_store = LocalVectorStore(active_store_path)
-        index_sync, vector_store, resolved_vector_backend = sync_index_with_store_fallback(
-            vector_store=vector_store,
-            resolved_backend=resolved_vector_backend,
-            vector_status=vector_store_status,
-            store_path=active_store_path,
-            embedder=embedder,
-            rebuild=rebuild_index,
-            embedding_model=embedding_model,
-            embedding_identity_value=index_embedding_identity,
-        )
+            vector_store = lexical_store
+        if rebuild_index:
+            index_sync, vector_store, resolved_vector_backend = sync_index_with_store_fallback(
+                vector_store=vector_store,
+                resolved_backend=resolved_vector_backend,
+                vector_status=vector_store_status,
+                store_path=active_store_path,
+                embedder=embedder,
+                rebuild=True,
+                embedding_model=embedding_model,
+                embedding_identity_value=index_embedding_identity,
+            )
+        else:
+            index_sync = index_status_without_rebuild(
+                vector_store=vector_store,
+                store_path=active_store_path,
+                embedding_model=embedding_model,
+                embedding_identity_value=index_embedding_identity,
+                reason="embedding_fallback_without_rebuild",
+            )
         (
             all_chunks,
             chunks,
@@ -2368,23 +2794,26 @@ def run_query(
             dense_results, attempts = call_with_retries(
                 lambda: [
                     (score, chunk)
-                    for score, chunk in vector_store.search(query_vector, DENSE_TOP_N)
+                    for score, chunk in vector_store.search(
+                        query_vector,
+                        DENSE_TOP_N,
+                        access_filter=qdrant_access_filter(scopes),
+                    )
                     if chunk.chunk_id in chunks_by_id
                 ]
             )
             vector_store_status["attempts"] = max(vector_store_status.get("attempts", 0), attempts)
         except RetryExhausted as exc:
             set_vector_store_fallback(vector_store_status, str(exc), exc.attempts)
-            vector_store = LocalVectorStore(active_store_path)
+            lexical_store = LocalVectorStore(active_store_path)
+            vector_store = lexical_store
             resolved_vector_backend = "local"
-            index_sync = sync_index(
-                RAW_DIR,
-                active_store_path,
-                vector_store=vector_store,
-                embedder=embedder,
-                rebuild=rebuild_index,
+            index_sync = index_status_without_rebuild(
+                vector_store=lexical_store,
+                store_path=active_store_path,
                 embedding_model=embedding_model,
                 embedding_identity_value=index_embedding_identity,
+                reason="qdrant_search_fallback",
             )
             (
                 all_chunks,
@@ -2401,8 +2830,11 @@ def run_query(
     stage_latencies_ms["dense_recall"] = int((time.perf_counter() - stage_started) * 1000)
 
     stage_started = time.perf_counter()
-    bm25_results = bm25_recall(query, chunks)
+    bm25_results = lexical_store.bm25_search(query, scopes)
     stage_latencies_ms["bm25_recall"] = int((time.perf_counter() - stage_started) * 1000)
+    for _, chunk in bm25_results:
+        chunks_by_id.setdefault(chunk.chunk_id, chunk)
+    chunks_by_parent = build_chunks_by_parent(list(chunks_by_id.values()))
 
     stage_started = time.perf_counter()
     fused = rrf_fuse(dense_results, bm25_results)

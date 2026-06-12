@@ -47,7 +47,7 @@
 - `scripts/serve_bge_reranker.py`：`bge-reranker-v2-m3` 的 FlagEmbedding / Transformers HTTP 服务。
 - `scripts/import_customer_support_dataset.py`：可选数据集导入脚本。
 - `data/DATASET_SOURCES.md`：数据来源和取舍说明。
-- `tests/`：权限、增量同步、Qdrant、模型请求、引用校验和监控测试。
+- `tests/`：权限、手动索引重建、Qdrant、模型请求、引用校验和监控测试。
 
 ## 0. 先说做成什么样
 
@@ -63,7 +63,7 @@
 Markdown 文档
   -> frontmatter metadata
   -> 权限 / 生效时间过滤
-  -> 增量同步
+  -> 手动索引重建
   -> parent section / child chunk
   -> Qdrant 向量库
   -> dense recall
@@ -263,13 +263,13 @@ OVERLAP_CHARS = 60
 
 这不是“最佳参数”，只是一个可观察起点。生产系统里，chunk size 应该由评测集、文档形态和上下文预算共同决定。
 
-### 第三步：增量同步索引
+### 第三步：手动重建索引
 
-`sync_index()` 会先确定实际 embedding identity，再比较文档内容 hash，只重建发生变化的文档。identity 会区分本地/外部方式和模型名，例如 `local:local-hash-embedding`、`local:nomic-embed-text` 或 `external:embedding-3`。
+索引不是每次查询都会自动同步 raw 文档。默认查询只加载已经存在的索引；只有显式加 `--rebuild-index` 时，脚本才会读取 `data/raw/`、重新切 chunk、计算 embedding 并写入 Qdrant 或 SQLite。embedding identity 会区分本地/外部方式和模型名，例如 `local:local-hash-embedding`、`local:nomic-embed-text` 或 `external:embedding-3`。
 
 本地 SQLite 存储会按 embedding identity 派生独立文件名，避免真实 embedding 索引和 hash fallback 索引互相覆盖。
 
-这解决的是 `mini_rag` 里很容易遇到的问题：文档改了，但索引还是旧的。
+这解决的是 `mini_rag` 里很容易遇到的问题：文档改了，但索引更新节奏没有被显式管理。
 
 生产系统里，索引不是临时缓存，而是系统状态。你要知道：
 
@@ -278,7 +278,7 @@ OVERLAP_CHARS = 60
 - 哪些文档从原始目录里消失了，所以要从索引删除；
 - 当前索引用的是哪个 embedding 模型。
 
-加 `--rebuild-index` 会强制重建整个 collection：
+加 `--rebuild-index` 会手动重建整个 collection / SQLite 索引：
 
 ```bash
 python run_pipeline.py --query "跨境订单退款多久到账？" --rebuild-index
@@ -286,7 +286,7 @@ python run_pipeline.py --query "跨境订单退款多久到账？" --rebuild-ind
 
 ### 第四步：权限和生效时间过滤
 
-`filter_chunks_for_access()` 会根据当前用户的 `--scopes` 过滤 chunk。
+权限和生效时间过滤在存储层完成：Qdrant 查询使用 payload filter，SQLite 查询使用表字段条件。`filter_chunks_for_access()` 仍保留为小规模测试和对照用的纯函数。
 
 默认查询 scope 是：
 
@@ -324,7 +324,7 @@ QDRANT_URL = http://localhost:6333
 QDRANT_COLLECTION = production_rag_chunks
 ```
 
-`QdrantVectorStore` 负责创建 collection、写入 points、查询 points，并为 `doc_id` 创建 payload index。增量同步需要按 `doc_id` 删除旧 chunk，所以这个 payload index 不是可有可无。
+`QdrantVectorStore` 负责创建 collection、写入 points、查询 points，并为 `doc_id` 创建 payload index。手动重建需要按 `doc_id` 删除旧 chunk，所以这个 payload index 不是可有可无。
 
 如果看到：
 
@@ -336,7 +336,7 @@ Index required but not found for "doc_id" of one of the following types: [keywor
 
 ### 第六步：dense recall
 
-`dense_recall()` 负责语义召回。
+`dense_recall()` 负责语义召回。本地 SQLite 模式会在已过滤的可见 chunk 上计算；Qdrant 模式会把权限和生效期 filter 一起发给向量库，并且 dense 查询结果不再请求返回 vector。
 
 主路径下，文档和 query embedding 都走智谱 `embedding-3`。只有在本地兜底模式里，才会用 hash embedding 代替真实 embedding 做离线排障。
 
@@ -352,7 +352,7 @@ python run_pipeline.py --query "跨境退款一般几天能回到卡里？" --tr
 
 ### 第七步：BM25 recall
 
-`bm25_recall()` 负责关键词召回。
+关键词召回由 SQLite FTS5 的 `bm25()` 完成，并在 SQL 查询里同时应用权限和生效期过滤。`bm25_recall()` 仍保留为纯函数对照。
 
 它对这类问题尤其有用：
 
@@ -567,27 +567,27 @@ python run_pipeline.py --query "今天北京天气怎么样？" --trace-only
 
 ## 7. 三个必须亲手试的实验
 
-### 实验一：改文档，观察增量同步
+### 实验一：改文档，手动重建索引
 
 修改 `data/raw/refund_policy.md` 里的退款时效描述。
 
-然后运行：
+然后运行一次不带 `--rebuild-index` 的查询：
 
 ```bash
 python run_pipeline.py --query "跨境订单退款多久到账？" --trace-only
 ```
 
-观察 `index_sync.changed_docs`。如果只改了这一篇，理论上只应该重建对应文档。
+此时默认只读取既有索引，`index_sync.changed_docs` 应该为空，答案仍来自上一次构建好的索引。
 
-再运行一次同样命令：
+再显式重建：
 
 ```bash
-python run_pipeline.py --query "跨境订单退款多久到账？" --trace-only
+python run_pipeline.py --query "跨境订单退款多久到账？" --rebuild-index --trace-only
 ```
 
-第二次 `changed_docs` 应该为空，因为索引已经是最新状态。
+这次 `changed_docs` 会记录被重新写入索引的文档。
 
-这个实验能帮你建立一个重要直觉：生产 RAG 的知识更新，不是“重新跑全量索引”这么粗糙。你要能知道变更范围，并尽量只更新必要部分。
+这个实验能帮你建立一个重要直觉：生产 RAG 的知识更新不是“查询时发现文档变化就立即 rebuild”，而是由明确的索引构建任务控制节奏。
 
 ### 实验二：比较 dense 和 BM25 的分工
 
@@ -749,9 +749,9 @@ ZHIPU_API_KEY
 
 ### 改了文档但答案没变
 
-先看 trace 里的 `index_sync.changed_docs`。如果为空，说明脚本认为文档内容和 embedding 模型没有变化。
+确认这次查询是否带了 `--rebuild-index`。默认查询不会扫描 `data/raw/`，所以改文档后答案不变是预期行为。
 
-也可以强制重建：
+手动重建：
 
 ```bash
 python run_pipeline.py --query "你的问题" --rebuild-index
@@ -779,7 +779,7 @@ python run_pipeline.py --query "你的问题" --rebuild-index
 ```text
 原始资料
   -> 带 metadata 的可治理资料
-  -> 可增量同步的索引
+  -> 可手动重建的索引
   -> 受权限约束的候选池
   -> dense + BM25 的召回集合
   -> rerank 后的相关证据

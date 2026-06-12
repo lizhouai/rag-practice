@@ -393,6 +393,54 @@ class DefaultFallbackBehaviorTest(unittest.TestCase):
             self.assertEqual(second["component_status"]["embedding"]["mode"], "hash_fallback")
             self.assertEqual(chunk_builds, 0)
 
+    def test_run_query_without_rebuild_reuses_existing_index_without_syncing_raw_docs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            store_path = tmp_path / "indexes" / "rag.sqlite"
+            metrics_path = tmp_path / "metrics" / "online_metrics.jsonl"
+            query = "\u8de8\u5883\u8ba2\u5355\u9000\u6b3e\u591a\u4e45\u5230\u8d26\uff1f"
+
+            with patch.dict(os.environ, {}, clear=True):
+                rag.run_query(
+                    query,
+                    quiet=True,
+                    rebuild_index=True,
+                    vector_backend="local",
+                    store_path=store_path,
+                    metrics_path=metrics_path,
+                )
+
+            with (
+                patch.dict(os.environ, {}, clear=True),
+                patch.object(rag, "sync_index", side_effect=AssertionError("index sync should be manual")),
+            ):
+                trace = rag.run_query(
+                    query,
+                    quiet=True,
+                    rebuild_index=False,
+                    vector_backend="local",
+                    store_path=store_path,
+                    metrics_path=metrics_path,
+                )
+
+            self.assertEqual(trace["index_sync"]["changed_docs"], [])
+            self.assertEqual(trace["index_sync"]["reason"], "rebuild_not_requested")
+
+    def test_sqlite_bm25_search_filters_permission_in_store(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store_path = Path(tmp) / "rag.sqlite"
+            store = rag.LocalVectorStore(store_path)
+            visible = make_chunk("visible", "internal")
+            visible.terms = rag.tokenize("refund timeline")
+            hidden = make_chunk("hidden", "finance_restricted")
+            hidden.terms = rag.tokenize("refund timeline")
+            store.upsert_document("visible_doc", "visible.md", "hash-1", "local:test", [visible])
+            store.upsert_document("hidden_doc", "hidden.md", "hash-2", "local:test", [hidden])
+
+            results = store.bm25_search("refund timeline", {"internal"}, top_n=5, today="2026-06-07")
+
+            self.assertEqual([chunk.chunk_id for _, chunk in results], ["visible"])
+
     def test_external_embedding_success_records_external_identity_before_index_sync(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -513,6 +561,7 @@ class DefaultFallbackBehaviorTest(unittest.TestCase):
                 first_external = rag.run_query(
                     "\u8de8\u5883\u8ba2\u5355\u9000\u6b3e\u591a\u4e45\u5230\u8d26\uff1f",
                     quiet=True,
+                    rebuild_index=True,
                     vector_backend="local",
                     store_path=store_path,
                     metrics_path=metrics_path,
@@ -522,6 +571,7 @@ class DefaultFallbackBehaviorTest(unittest.TestCase):
                 hash_fallback = rag.run_query(
                     "\u8de8\u5883\u8ba2\u5355\u9000\u6b3e\u591a\u4e45\u5230\u8d26\uff1f",
                     quiet=True,
+                    rebuild_index=True,
                     vector_backend="local",
                     store_path=store_path,
                     metrics_path=metrics_path,
@@ -1078,8 +1128,10 @@ class QdrantVectorStoreTest(unittest.TestCase):
         self.assertEqual(captured["method"], "POST")
         self.assertEqual(body["query"], [0.1, 0.2])
         self.assertEqual(body["limit"], 3)
+        self.assertEqual(body["with_vector"], False)
         self.assertEqual(results[0][0], 0.87)
         self.assertEqual(results[0][1].chunk_id, "chunk-1")
+        self.assertEqual(results[0][1].dense_vector, [])
 
 
 class ProviderClientTest(unittest.TestCase):
