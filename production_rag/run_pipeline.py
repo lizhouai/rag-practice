@@ -60,10 +60,15 @@ DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com/anthropic"
 DEFAULT_ZHIPU_EMBEDDING_BASE_URL = "https://open.bigmodel.cn/api/paas/v4"
 DEFAULT_EMBEDDING_DIMENSIONS = 1024
 LOCAL_EMBEDDING_MODEL = "local-hash-embedding"
+EMBEDDING_PROVIDER_LOCAL = "local"
+EMBEDDING_PROVIDER_EXTERNAL = "external"
+LOCAL_EMBEDDING_HOSTS = {"localhost", "127.0.0.1", "0.0.0.0", "::1", "host.docker.internal"}
 DEFAULT_ALLOWED_SCOPES = {"internal", "public"}
 DEFAULT_RERANKER_MODEL = "bge-reranker-v2-m3"
 DEFAULT_RERANKER_URL = "http://127.0.0.1:8008/rerank"
 EXTERNAL_RERANKER_PROVIDERS = {"external", "http", "flagembedding", "transformers", "bge"}
+DEFAULT_RETRY_ATTEMPTS = 3
+DEFAULT_RETRY_BACKOFF_SECONDS = 0.05
 
 STOPWORDS = {
     "的",
@@ -128,12 +133,49 @@ class SelectedEvidence:
     expanded_token_count: int
 
 
+class RetryExhausted(RuntimeError):
+    def __init__(self, message: str, attempts: int) -> None:
+        super().__init__(message)
+        self.attempts = attempts
+
+
+class ComponentFallback(RuntimeError):
+    def __init__(self, component: str, reason: str, error: str, attempts: int) -> None:
+        super().__init__(error)
+        self.component = component
+        self.reason = reason
+        self.error = error
+        self.attempts = attempts
+
+
+def call_with_retries(
+    operation,
+    *,
+    attempts: int = DEFAULT_RETRY_ATTEMPTS,
+    backoff_seconds: float = DEFAULT_RETRY_BACKOFF_SECONDS,
+):
+    attempts = max(1, attempts)
+    last_exc: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return operation(), attempt
+        except ComponentFallback:
+            raise
+        except Exception as exc:  # noqa: BLE001 - component adapters normalize failure in trace.
+            last_exc = exc
+            if attempt < attempts and backoff_seconds > 0:
+                time.sleep(backoff_seconds * (2 ** (attempt - 1)))
+    message = str(last_exc) if last_exc else "operation failed"
+    raise RetryExhausted(message, attempts) from last_exc
+
+
 @dataclass
 class ExternalReranker:
     url: str
     model: str = DEFAULT_RERANKER_MODEL
     timeout_seconds: int = 30
     last_error: str = ""
+    last_attempts: int = 0
     fallback_used: bool = False
 
     def score(self, query: str, chunks: list[Chunk]) -> list[float]:
@@ -165,7 +207,7 @@ class ExternalReranker:
 
 @dataclass
 class AnthropicMessagesClient:
-    api_key: str
+    api_key: str | None
     base_url: str
 
     def create_message(
@@ -186,20 +228,16 @@ class AnthropicMessagesClient:
                 }
             ],
         }
-        payload = post_json(
-            f"{self.base_url.rstrip('/')}/v1/messages",
-            body,
-            headers={
-                "x-api-key": self.api_key,
-                "anthropic-version": "2023-06-01",
-            },
-        )
+        headers = {"anthropic-version": "2023-06-01"}
+        if self.api_key:
+            headers["x-api-key"] = self.api_key
+        payload = post_json(f"{self.base_url.rstrip('/')}/v1/messages", body, headers=headers)
         return extract_anthropic_text(payload)
 
 
 @dataclass
 class OpenAICompatibleEmbeddingClient:
-    api_key: str
+    api_key: str | None
     base_url: str
 
     def embed_texts(
@@ -213,11 +251,8 @@ class OpenAICompatibleEmbeddingClient:
         body: dict[str, object] = {"model": model, "input": texts}
         if dimensions:
             body["dimensions"] = dimensions
-        payload = post_json(
-            f"{self.base_url.rstrip('/')}/embeddings",
-            body,
-            headers={"Authorization": f"Bearer {self.api_key}"},
-        )
+        headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
+        payload = post_json(f"{self.base_url.rstrip('/')}/embeddings", body, headers=headers)
         data = payload.get("data", [])
         if not isinstance(data, list):
             raise RuntimeError("Embedding response missing data list.")
@@ -311,6 +346,10 @@ def env_first(*names: str, default: str | None = None) -> str | None:
     return default
 
 
+def has_env_value(*names: str) -> bool:
+    return any(bool(os.getenv(name)) for name in names)
+
+
 def resolve_llm_base_url() -> str:
     return env_first(
         "LLM_BASE_URL",
@@ -329,8 +368,33 @@ def resolve_embedding_base_url() -> str:
     ) or DEFAULT_ZHIPU_EMBEDDING_BASE_URL
 
 
+def resolve_embedding_provider(base_url: str | None = None) -> str:
+    explicit_provider = os.getenv("EMBEDDING_PROVIDER", "").strip().lower()
+    if explicit_provider in {EMBEDDING_PROVIDER_LOCAL, EMBEDDING_PROVIDER_EXTERNAL}:
+        return explicit_provider
+
+    resolved_base_url = (base_url if base_url is not None else resolve_embedding_base_url()).strip()
+    url_for_parse = resolved_base_url if "://" in resolved_base_url else f"http://{resolved_base_url}"
+    parsed = urllib.parse.urlparse(url_for_parse)
+    hostname = (parsed.hostname or "").lower()
+    if hostname in LOCAL_EMBEDDING_HOSTS or hostname.startswith("127."):
+        return EMBEDDING_PROVIDER_LOCAL
+    return EMBEDDING_PROVIDER_EXTERNAL
+
+
 def resolve_qdrant_url() -> str:
     return env_first("QDRANT_URL", "VECTOR_DB_URL", default=DEFAULT_QDRANT_URL) or DEFAULT_QDRANT_URL
+
+
+def is_qdrant_configured() -> bool:
+    return has_env_value(
+        "QDRANT_URL",
+        "VECTOR_DB_URL",
+        "QDRANT_COLLECTION",
+        "VECTOR_DB_COLLECTION",
+        "QDRANT_API_KEY",
+        "VECTOR_DB_API_KEY",
+    )
 
 
 def resolve_qdrant_api_key() -> str | None:
@@ -341,6 +405,20 @@ def resolve_qdrant_collection() -> str:
     return (
         env_first("QDRANT_COLLECTION", "VECTOR_DB_COLLECTION", default=DEFAULT_QDRANT_COLLECTION)
         or DEFAULT_QDRANT_COLLECTION
+    )
+
+
+def is_llm_configured() -> bool:
+    return bool(
+        env_first("LLM_API_KEY", "ANTHROPIC_API_KEY", "DEEPSEEK_API_KEY")
+        or has_env_value("LLM_BASE_URL", "ANTHROPIC_BASE_URL", "DEEPSEEK_BASE_URL")
+    )
+
+
+def is_embedding_configured() -> bool:
+    return bool(
+        env_first("EMBEDDING_API_KEY", "ZHIPU_API_KEY")
+        or has_env_value("EMBEDDING_BASE_URL", "ZHIPU_EMBEDDING_BASE_URL", "ZHIPUAI_BASE_URL")
     )
 
 
@@ -405,6 +483,21 @@ def content_hash(text: str, embedding_model: str, dimensions: int) -> str:
     digest.update(b"\0")
     digest.update(text.encode("utf-8"))
     return digest.hexdigest()
+
+
+def embedding_identity(provider: str, model: str) -> str:
+    return f"{provider.strip().lower()}:{model.strip()}"
+
+
+def safe_path_slug(value: str, *, max_length: int = 80) -> str:
+    slug = re.sub(r"[^A-Za-z0-9_.-]+", "_", value.strip()).strip("._")
+    return (slug or "embedding")[:max_length]
+
+
+def local_store_path_for_embedding_identity(store_path: Path, identity: str) -> Path:
+    slug = safe_path_slug(identity)
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:12]
+    return store_path.with_name(f"{store_path.stem}.{slug}.{digest}{store_path.suffix}")
 
 
 class LocalVectorStore:
@@ -1031,6 +1124,115 @@ def make_vector_store(
     raise RuntimeError(f"Unsupported vector backend: {vector_backend}")
 
 
+def set_vector_store_fallback(status: dict, error: str, attempts: int) -> None:
+    status.update(
+        {
+            "mode": "sqlite_fallback",
+            "backend": "local",
+            "fallback_used": True,
+            "reason": "qdrant_error",
+            "error": error,
+            "attempts": attempts,
+        }
+    )
+
+
+def initialize_vector_store_with_fallback(
+    requested_backend: str,
+    *,
+    store_path: Path = DEFAULT_VECTOR_DB_PATH,
+    vector_size: int = DEFAULT_EMBEDDING_DIMENSIONS,
+    status: dict,
+) -> tuple[object, str]:
+    status.update(
+        {
+            "component": "vector_store",
+            "requested_backend": requested_backend,
+            "backend": requested_backend,
+            "mode": requested_backend,
+            "fallback_used": False,
+            "reason": "configured_backend" if requested_backend == "qdrant" else "requested_local",
+            "error": "",
+            "attempts": 0,
+            "qdrant_url": resolve_qdrant_url() if requested_backend == "qdrant" else "",
+            "qdrant_collection": resolve_qdrant_collection() if requested_backend == "qdrant" else "",
+        }
+    )
+    if requested_backend == "local":
+        return LocalVectorStore(store_path), "local"
+
+    if requested_backend == "qdrant" and not is_qdrant_configured():
+        status.update(
+            {
+                "mode": "sqlite_fallback",
+                "backend": "local",
+                "fallback_used": True,
+                "reason": "not_configured",
+                "error": "Qdrant is not configured. Set QDRANT_URL or VECTOR_DB_URL to enable Qdrant.",
+                "attempts": 0,
+                "qdrant_url": "",
+                "qdrant_collection": "",
+            }
+        )
+        return LocalVectorStore(store_path), "local"
+
+    vector_store = make_vector_store(requested_backend, store_path=store_path, vector_size=vector_size)
+    if hasattr(vector_store, "ensure_collection"):
+        try:
+            _, attempts = call_with_retries(lambda: vector_store.ensure_collection())
+            status["attempts"] = attempts
+        except RetryExhausted as exc:
+            set_vector_store_fallback(status, str(exc), exc.attempts)
+            return LocalVectorStore(store_path), "local"
+    return vector_store, requested_backend
+
+
+def sync_index_with_store_fallback(
+    *,
+    vector_store: object,
+    resolved_backend: str,
+    vector_status: dict,
+    raw_dir: Path = RAW_DIR,
+    store_path: Path = DEFAULT_VECTOR_DB_PATH,
+    embedder: object | None = None,
+    rebuild: bool = False,
+    embedding_model: str | None = None,
+    embedding_identity_value: str | None = None,
+) -> tuple[dict, object, str]:
+    attempts = DEFAULT_RETRY_ATTEMPTS if resolved_backend == "qdrant" else 1
+    try:
+        index_sync, used_attempts = call_with_retries(
+            lambda: sync_index(
+                raw_dir,
+                store_path,
+                vector_store=vector_store,
+                embedder=embedder,
+                rebuild=rebuild,
+                embedding_model=embedding_model,
+                embedding_identity_value=embedding_identity_value,
+            ),
+            attempts=attempts,
+        )
+        if resolved_backend == "qdrant":
+            vector_status["attempts"] = max(vector_status.get("attempts", 0), used_attempts)
+        return index_sync, vector_store, resolved_backend
+    except RetryExhausted as exc:
+        if resolved_backend != "qdrant":
+            raise
+        set_vector_store_fallback(vector_status, str(exc), exc.attempts)
+        local_store = LocalVectorStore(store_path)
+        index_sync = sync_index(
+            raw_dir,
+            store_path,
+            vector_store=local_store,
+            embedder=embedder,
+            rebuild=rebuild,
+            embedding_model=embedding_model,
+            embedding_identity_value=embedding_identity_value,
+        )
+        return index_sync, local_store, "local"
+
+
 def build_document_chunks(metadata: dict[str, str], body: str) -> list[Chunk]:
     chunks: list[Chunk] = []
     for parent in split_sections(metadata, body):
@@ -1046,9 +1248,14 @@ def sync_index(
     embedder: object | None = None,
     rebuild: bool = False,
     embedding_model: str | None = None,
+    embedding_identity_value: str | None = None,
 ) -> dict:
     """Sync changed markdown documents into the configured vector store."""
     model_name = embedding_model or (DEFAULT_EMBEDDING_MODEL if embedder else LOCAL_EMBEDDING_MODEL)
+    index_identity = embedding_identity_value or embedding_identity(
+        EMBEDDING_PROVIDER_EXTERNAL if embedder else EMBEDDING_PROVIDER_LOCAL,
+        model_name,
+    )
     dimensions = resolve_vector_dimensions()
     store = vector_store or LocalVectorStore(store_path)
     if rebuild:
@@ -1069,13 +1276,13 @@ def sync_index(
         metadata.setdefault("effective_to", "")
         doc_id = metadata["doc_id"]
         current_doc_ids.add(doc_id)
-        hash_value = content_hash(raw_text, model_name, dimensions)
+        hash_value = content_hash(raw_text, index_identity, dimensions)
 
         existing = manifest.get(doc_id)
         if (
             existing
             and existing["content_hash"] == hash_value
-            and existing["embedding_model"] == model_name
+            and existing["embedding_model"] == index_identity
         ):
             continue
 
@@ -1088,7 +1295,7 @@ def sync_index(
             doc_id=doc_id,
             source_path=metadata.get("source_path", ""),
             hash_value=hash_value,
-            embedding_model=model_name,
+            embedding_model=index_identity,
             chunks=chunks,
         )
         changed_docs.append(doc_id)
@@ -1098,6 +1305,7 @@ def sync_index(
     return {
         "store": store.describe() if hasattr(store, "describe") else str(store_path),
         "embedding_model": model_name,
+        "embedding_identity": index_identity,
         "changed_docs": changed_docs,
         "removed_docs": sorted(removed_docs),
         "chunks_count": len(store.load_chunks()),
@@ -1223,9 +1431,11 @@ def rerank(
     ordered_candidates = list(candidates.values())
     chunks = [chunks_by_id[candidate.chunk_id] for candidate in ordered_candidates]
     try:
-        scores = external_reranker.score(query, chunks)
-    except Exception as exc:  # noqa: BLE001 - a configured reranker failure should not stop retrieval.
+        scores, attempts = call_with_retries(lambda: external_reranker.score(query, chunks))
+        external_reranker.last_attempts = attempts
+    except RetryExhausted as exc:
         external_reranker.last_error = str(exc)
+        external_reranker.last_attempts = exc.attempts
         return skip_rerank(candidates, "reranker_error")
     for candidate, score in zip(ordered_candidates, scores):
         candidate.rerank_score = score
@@ -1242,6 +1452,7 @@ def describe_reranker(external_reranker: ExternalReranker | None) -> dict:
             "url": "",
             "fallback_used": False,
             "error": "",
+            "attempts": 0,
             "score_policy": SCORE_POLICY_RRF_ONLY,
         }
     if external_reranker.last_error:
@@ -1252,6 +1463,7 @@ def describe_reranker(external_reranker: ExternalReranker | None) -> dict:
             "url": external_reranker.url,
             "fallback_used": False,
             "error": external_reranker.last_error,
+            "attempts": external_reranker.last_attempts,
             "score_policy": SCORE_POLICY_RRF_ONLY,
         }
     return {
@@ -1261,6 +1473,7 @@ def describe_reranker(external_reranker: ExternalReranker | None) -> dict:
         "url": external_reranker.url,
         "fallback_used": False,
         "error": "",
+        "attempts": external_reranker.last_attempts,
         "score_policy": SCORE_POLICY_EXTERNAL_RERANK,
     }
 
@@ -1695,8 +1908,11 @@ def generate_answer_with_llm(context_packet: dict) -> dict:
     if not context_packet["sufficiency"]["enough"]:
         return generate_answer(context_packet)
     api_key = env_first("LLM_API_KEY", "ANTHROPIC_API_KEY", "DEEPSEEK_API_KEY")
-    if not api_key:
-        raise RuntimeError("Missing LLM API key. Set LLM_API_KEY, ANTHROPIC_API_KEY, or DEEPSEEK_API_KEY.")
+    if not is_llm_configured():
+        raise RuntimeError(
+            "Missing LLM configuration. Set LLM_API_KEY, ANTHROPIC_API_KEY, DEEPSEEK_API_KEY, "
+            "or an explicit LLM_BASE_URL/ANTHROPIC_BASE_URL/DEEPSEEK_BASE_URL."
+        )
     model_name = env_first("LLM_MODEL", default=DEFAULT_CHAT_MODEL) or DEFAULT_CHAT_MODEL
     client = AnthropicMessagesClient(api_key=api_key, base_url=resolve_llm_base_url())
     answer_text = client.create_message(
@@ -1714,8 +1930,11 @@ def generate_answer_with_llm(context_packet: dict) -> dict:
 
 def make_embedding_function(dimensions: int | None = None):
     api_key = env_first("EMBEDDING_API_KEY", "ZHIPU_API_KEY")
-    if not api_key:
-        raise RuntimeError("Missing embedding API key. Set EMBEDDING_API_KEY or ZHIPU_API_KEY.")
+    if not is_embedding_configured():
+        raise RuntimeError(
+            "Missing embedding configuration. Set EMBEDDING_API_KEY, ZHIPU_API_KEY, "
+            "or an explicit EMBEDDING_BASE_URL/ZHIPU_EMBEDDING_BASE_URL/ZHIPUAI_BASE_URL."
+        )
     client = OpenAICompatibleEmbeddingClient(api_key=api_key, base_url=resolve_embedding_base_url())
     embedding_dimensions = dimensions or resolve_vector_dimensions()
 
@@ -1733,6 +1952,81 @@ def make_embedding_function(dimensions: int | None = None):
         return vectors
 
     return embed
+
+
+def make_retrying_embedding_function(status: dict, dimensions: int | None = None):
+    embed_once = make_embedding_function(dimensions)
+
+    def embed(texts: list[str]) -> list[list[float]]:
+        try:
+            vectors, attempts = call_with_retries(lambda: embed_once(texts))
+            status["attempts"] = max(status.get("attempts", 0), attempts)
+            return vectors
+        except RetryExhausted as exc:
+            error = str(exc)
+            status.update(
+                {
+                    "mode": "hash_fallback",
+                    "provider": EMBEDDING_PROVIDER_LOCAL,
+                    "model": LOCAL_EMBEDDING_MODEL,
+                    "identity": embedding_identity(EMBEDDING_PROVIDER_LOCAL, LOCAL_EMBEDDING_MODEL),
+                    "fallback_used": True,
+                    "reason": "embedding_error",
+                    "error": error,
+                    "attempts": exc.attempts,
+                }
+            )
+            raise ComponentFallback("embedding", "embedding_error", error, exc.attempts) from exc
+
+    return embed
+
+
+def generate_answer_resilient(context_packet: dict, status: dict) -> dict:
+    if not is_llm_configured():
+        status.update(
+            {
+                "mode": "extractive_fallback",
+                "fallback_used": True,
+                "reason": "not_configured",
+                "error": "",
+                "attempts": 0,
+            }
+        )
+        return generate_answer(context_packet)
+    if not context_packet["sufficiency"]["enough"]:
+        status.update(
+            {
+                "mode": "skipped",
+                "fallback_used": False,
+                "reason": "insufficient_context",
+                "error": "",
+                "attempts": 0,
+            }
+        )
+        return generate_answer(context_packet)
+    try:
+        answer, attempts = call_with_retries(lambda: generate_answer_with_llm(context_packet))
+        status.update(
+            {
+                "mode": "llm",
+                "fallback_used": False,
+                "reason": "configured_model",
+                "error": "",
+                "attempts": attempts,
+            }
+        )
+        return answer
+    except RetryExhausted as exc:
+        status.update(
+            {
+                "mode": "extractive_fallback",
+                "fallback_used": True,
+                "reason": "llm_error",
+                "error": str(exc),
+                "attempts": exc.attempts,
+            }
+        )
+        return generate_answer(context_packet)
 
 
 def validate_citations(answer: dict, context_packet: dict) -> dict:
@@ -1762,6 +2056,7 @@ def build_monitoring_event(trace: dict, latency_ms: int, status: str) -> dict:
         "index_version": trace.get("index_version"),
         "vector_backend": model_config.get("vector_backend"),
         "embedding_model": model_config.get("embedding_model"),
+        "embedding_identity": model_config.get("embedding_identity"),
         "qdrant_collection": model_config.get("qdrant_collection"),
         "query_hash": hashlib.sha256(trace.get("query", "").encode("utf-8")).hexdigest()[:16],
         "query_chars": len(trace.get("query", "")),
@@ -1813,6 +2108,61 @@ def summarize_results(results: Iterable[tuple[float, Chunk]]) -> list[dict]:
     ]
 
 
+def build_llm_status() -> dict:
+    configured = is_llm_configured()
+    return {
+        "component": "llm",
+        "configured": configured,
+        "requested_model": env_first("LLM_MODEL", default=DEFAULT_CHAT_MODEL) or DEFAULT_CHAT_MODEL,
+        "model": env_first("LLM_MODEL", default=DEFAULT_CHAT_MODEL) or DEFAULT_CHAT_MODEL,
+        "base_url": resolve_llm_base_url() if configured else "",
+        "mode": "pending" if configured else "extractive_fallback",
+        "fallback_used": not configured,
+        "reason": "configured_model" if configured else "not_configured",
+        "error": "",
+        "attempts": 0,
+    }
+
+
+def build_embedding_status() -> dict:
+    configured = is_embedding_configured()
+    requested_model = env_first("EMBEDDING_MODEL", default=DEFAULT_EMBEDDING_MODEL) or DEFAULT_EMBEDDING_MODEL
+    base_url = resolve_embedding_base_url() if configured else ""
+    provider = resolve_embedding_provider(base_url) if configured else EMBEDDING_PROVIDER_LOCAL
+    model = requested_model if configured else LOCAL_EMBEDDING_MODEL
+    return {
+        "component": "embedding",
+        "configured": configured,
+        "requested_model": requested_model,
+        "provider": provider,
+        "model": model,
+        "identity": embedding_identity(provider, model),
+        "base_url": base_url,
+        "mode": provider if configured else "hash_fallback",
+        "fallback_used": not configured,
+        "reason": "configured_model" if configured else "not_configured",
+        "error": "",
+        "attempts": 0,
+    }
+
+
+def fallback_summary(component_status: dict[str, dict]) -> list[dict]:
+    fallbacks: list[dict] = []
+    for component, status in component_status.items():
+        if not status.get("fallback_used"):
+            continue
+        fallbacks.append(
+            {
+                "component": component,
+                "mode": status.get("mode", ""),
+                "reason": status.get("reason", ""),
+                "error": status.get("error", ""),
+                "attempts": status.get("attempts", 0),
+            }
+        )
+    return fallbacks
+
+
 def run_query(
     query: str,
     trace_only: bool = False,
@@ -1821,7 +2171,6 @@ def run_query(
     *,
     allowed_scopes: set[str] | None = None,
     rebuild_index: bool = False,
-    real_models: bool = False,
     vector_backend: str = DEFAULT_VECTOR_BACKEND,
     store_path: Path = DEFAULT_VECTOR_DB_PATH,
     monitoring_enabled: bool = True,
@@ -1829,47 +2178,224 @@ def run_query(
 ) -> dict:
     started = time.perf_counter()
     stage_latencies_ms: dict[str, int] = {}
+    llm_status = build_llm_status()
+    embedding_status = build_embedding_status()
+    vector_store_status: dict = {}
     scopes = allowed_scopes or DEFAULT_ALLOWED_SCOPES
-    stage_started = time.perf_counter()
-    embedder = make_embedding_function() if real_models else None
-    embedding_model = (
-        env_first("EMBEDDING_MODEL", default=DEFAULT_EMBEDDING_MODEL)
-        if real_models
-        else LOCAL_EMBEDDING_MODEL
-    )
     vector_size = resolve_vector_dimensions()
-    vector_store = make_vector_store(vector_backend, store_path=store_path, vector_size=vector_size)
-    if hasattr(vector_store, "ensure_collection"):
-        vector_store.ensure_collection()
-    index_sync = sync_index(
-        RAW_DIR,
-        store_path,
-        vector_store=vector_store,
-        embedder=embedder,
-        rebuild=rebuild_index,
-        embedding_model=embedding_model,
-    )
-    stage_latencies_ms["index_sync"] = int((time.perf_counter() - stage_started) * 1000)
+    embedder = make_retrying_embedding_function(embedding_status, vector_size) if embedding_status["configured"] else None
+    embedding_model = embedding_status["model"]
+    index_embedding_identity = embedding_status["identity"]
+    active_store_path = local_store_path_for_embedding_identity(store_path, index_embedding_identity)
+    query_vector: list[float] | None = None
+    stage_started = time.perf_counter()
+    try:
+        query_vector = embedder([query])[0] if embedder else vectorize(tokenize(query))
+    except ComponentFallback as exc:
+        embedding_status.update(
+            {
+                "mode": "hash_fallback",
+                "provider": EMBEDDING_PROVIDER_LOCAL,
+                "model": LOCAL_EMBEDDING_MODEL,
+                "identity": embedding_identity(EMBEDDING_PROVIDER_LOCAL, LOCAL_EMBEDDING_MODEL),
+                "fallback_used": True,
+                "reason": exc.reason,
+                "error": exc.error,
+                "attempts": exc.attempts,
+            }
+        )
+        embedder = None
+        embedding_model = LOCAL_EMBEDDING_MODEL
+        index_embedding_identity = embedding_status["identity"]
+        active_store_path = local_store_path_for_embedding_identity(store_path, index_embedding_identity)
+        query_vector = vectorize(tokenize(query))
+    stage_latencies_ms["embedding_probe"] = int((time.perf_counter() - stage_started) * 1000)
 
     stage_started = time.perf_counter()
-    all_chunks = vector_store.load_chunks()
-    chunks, rejected_chunks = filter_chunks_for_access(all_chunks, scopes)
-    permission_blocked_matches = find_permission_blocked_matches(query, all_chunks, rejected_chunks)
-    parents_count = len({chunk.parent_id for chunk in chunks})
-    chunks_by_id = {chunk.chunk_id: chunk for chunk in chunks}
-    chunks_by_parent = build_chunks_by_parent(chunks)
+    vector_store, resolved_vector_backend = initialize_vector_store_with_fallback(
+        vector_backend,
+        store_path=active_store_path,
+        vector_size=vector_size,
+        status=vector_store_status,
+    )
+    stage_latencies_ms["vector_store_probe"] = int((time.perf_counter() - stage_started) * 1000)
+
+    stage_started = time.perf_counter()
+    try:
+        index_sync, vector_store, resolved_vector_backend = sync_index_with_store_fallback(
+            vector_store=vector_store,
+            resolved_backend=resolved_vector_backend,
+            vector_status=vector_store_status,
+            store_path=active_store_path,
+            embedder=embedder,
+            rebuild=rebuild_index,
+            embedding_model=embedding_model,
+            embedding_identity_value=index_embedding_identity,
+        )
+    except ComponentFallback as exc:
+        embedding_status.update(
+            {
+                "mode": "hash_fallback",
+                "provider": EMBEDDING_PROVIDER_LOCAL,
+                "model": LOCAL_EMBEDDING_MODEL,
+                "identity": embedding_identity(EMBEDDING_PROVIDER_LOCAL, LOCAL_EMBEDDING_MODEL),
+                "fallback_used": True,
+                "reason": exc.reason,
+                "error": exc.error,
+                "attempts": exc.attempts,
+            }
+        )
+        embedder = None
+        embedding_model = LOCAL_EMBEDDING_MODEL
+        index_embedding_identity = embedding_status["identity"]
+        active_store_path = local_store_path_for_embedding_identity(store_path, index_embedding_identity)
+        if resolved_vector_backend == "local":
+            vector_store = LocalVectorStore(active_store_path)
+        query_vector = vectorize(tokenize(query))
+        index_sync, vector_store, resolved_vector_backend = sync_index_with_store_fallback(
+            vector_store=vector_store,
+            resolved_backend=resolved_vector_backend,
+            vector_status=vector_store_status,
+            store_path=active_store_path,
+            embedder=embedder,
+            rebuild=rebuild_index,
+            embedding_model=embedding_model,
+            embedding_identity_value=index_embedding_identity,
+        )
+    stage_latencies_ms["index_sync"] = int((time.perf_counter() - stage_started) * 1000)
+
+    def load_access_state():
+        nonlocal index_sync, resolved_vector_backend, vector_store
+
+        def load_chunks() -> list[Chunk]:
+            if resolved_vector_backend == "qdrant":
+                loaded, attempts = call_with_retries(lambda: vector_store.load_chunks())
+                vector_store_status["attempts"] = max(vector_store_status.get("attempts", 0), attempts)
+                return loaded
+            return vector_store.load_chunks()
+
+        try:
+            loaded_chunks = load_chunks()
+        except RetryExhausted as exc:
+            if resolved_vector_backend != "qdrant":
+                raise
+            set_vector_store_fallback(vector_store_status, str(exc), exc.attempts)
+            vector_store = LocalVectorStore(active_store_path)
+            resolved_vector_backend = "local"
+            index_sync = sync_index(
+                RAW_DIR,
+                active_store_path,
+                vector_store=vector_store,
+                embedder=embedder,
+                rebuild=rebuild_index,
+                embedding_model=embedding_model,
+                embedding_identity_value=index_embedding_identity,
+            )
+            loaded_chunks = vector_store.load_chunks()
+
+        visible_chunks, rejected = filter_chunks_for_access(loaded_chunks, scopes)
+        blocked_matches = find_permission_blocked_matches(query, loaded_chunks, rejected)
+        visible_chunks_by_id = {chunk.chunk_id: chunk for chunk in visible_chunks}
+        return (
+            loaded_chunks,
+            visible_chunks,
+            rejected,
+            blocked_matches,
+            len({chunk.parent_id for chunk in visible_chunks}),
+            visible_chunks_by_id,
+            build_chunks_by_parent(visible_chunks),
+        )
+
+    stage_started = time.perf_counter()
+    (
+        all_chunks,
+        chunks,
+        rejected_chunks,
+        permission_blocked_matches,
+        parents_count,
+        chunks_by_id,
+        chunks_by_parent,
+    ) = load_access_state()
     stage_latencies_ms["access_filter"] = int((time.perf_counter() - stage_started) * 1000)
 
     stage_started = time.perf_counter()
     # The query vector must come from the same vectorizer (and dimensions) as
     # the stored chunk vectors, regardless of which store serves the search.
-    query_vector = embedder([query])[0] if embedder else vectorize(tokenize(query))
-    if vector_backend == "qdrant":
-        dense_results = [
-            (score, chunk)
-            for score, chunk in vector_store.search(query_vector, DENSE_TOP_N)
-            if chunk.chunk_id in chunks_by_id
-        ]
+    try:
+        query_vector = query_vector or (embedder([query])[0] if embedder else vectorize(tokenize(query)))
+    except ComponentFallback as exc:
+        embedding_status.update(
+            {
+                "mode": "hash_fallback",
+                "provider": EMBEDDING_PROVIDER_LOCAL,
+                "model": LOCAL_EMBEDDING_MODEL,
+                "identity": embedding_identity(EMBEDDING_PROVIDER_LOCAL, LOCAL_EMBEDDING_MODEL),
+                "fallback_used": True,
+                "reason": exc.reason,
+                "error": exc.error,
+                "attempts": exc.attempts,
+            }
+        )
+        embedder = None
+        embedding_model = LOCAL_EMBEDDING_MODEL
+        index_embedding_identity = embedding_status["identity"]
+        active_store_path = local_store_path_for_embedding_identity(store_path, index_embedding_identity)
+        if resolved_vector_backend == "local":
+            vector_store = LocalVectorStore(active_store_path)
+        index_sync, vector_store, resolved_vector_backend = sync_index_with_store_fallback(
+            vector_store=vector_store,
+            resolved_backend=resolved_vector_backend,
+            vector_status=vector_store_status,
+            store_path=active_store_path,
+            embedder=embedder,
+            rebuild=rebuild_index,
+            embedding_model=embedding_model,
+            embedding_identity_value=index_embedding_identity,
+        )
+        (
+            all_chunks,
+            chunks,
+            rejected_chunks,
+            permission_blocked_matches,
+            parents_count,
+            chunks_by_id,
+            chunks_by_parent,
+        ) = load_access_state()
+        query_vector = vectorize(tokenize(query))
+
+    if resolved_vector_backend == "qdrant":
+        try:
+            dense_results, attempts = call_with_retries(
+                lambda: [
+                    (score, chunk)
+                    for score, chunk in vector_store.search(query_vector, DENSE_TOP_N)
+                    if chunk.chunk_id in chunks_by_id
+                ]
+            )
+            vector_store_status["attempts"] = max(vector_store_status.get("attempts", 0), attempts)
+        except RetryExhausted as exc:
+            set_vector_store_fallback(vector_store_status, str(exc), exc.attempts)
+            vector_store = LocalVectorStore(active_store_path)
+            resolved_vector_backend = "local"
+            index_sync = sync_index(
+                RAW_DIR,
+                active_store_path,
+                vector_store=vector_store,
+                embedder=embedder,
+                rebuild=rebuild_index,
+                embedding_model=embedding_model,
+                embedding_identity_value=index_embedding_identity,
+            )
+            (
+                all_chunks,
+                chunks,
+                rejected_chunks,
+                permission_blocked_matches,
+                parents_count,
+                chunks_by_id,
+                chunks_by_parent,
+            ) = load_access_state()
+            dense_results = dense_recall(query_vector, chunks)
     else:
         dense_results = dense_recall(query_vector, chunks)
     stage_latencies_ms["dense_recall"] = int((time.perf_counter() - stage_started) * 1000)
@@ -1924,9 +2450,15 @@ def run_query(
     stage_latencies_ms["context"] = int((time.perf_counter() - stage_started) * 1000)
 
     stage_started = time.perf_counter()
-    answer = generate_answer_with_llm(context_packet) if real_models else generate_answer(context_packet)
+    answer = generate_answer_resilient(context_packet, llm_status)
     stage_latencies_ms["answer"] = int((time.perf_counter() - stage_started) * 1000)
     validation = validate_citations(answer, context_packet)
+    component_status = {
+        "llm": llm_status,
+        "embedding": embedding_status,
+        "vector_store": vector_store_status,
+        "reranker": reranker_info,
+    }
 
     trace = {
         "trace_id": f"{datetime.now().strftime('%Y%m%d-%H%M%S-%f')}-{uuid.uuid4().hex[:8]}",
@@ -1934,18 +2466,24 @@ def run_query(
         "pipeline_version": "production_rag_pipeline_v2",
         "index_version": index_sync["store"],
         "model_config": {
-            "llm_model": env_first("LLM_MODEL", default=DEFAULT_CHAT_MODEL),
+            "llm_model": llm_status["model"],
             "llm_api_style": DEFAULT_LLM_API_STYLE,
-            "llm_base_url": resolve_llm_base_url() if real_models else "offline_extractive",
+            "llm_base_url": llm_status["base_url"] if not llm_status["fallback_used"] else "offline_extractive",
             "embedding_model": embedding_model,
-            "embedding_base_url": resolve_embedding_base_url() if real_models else "offline_hash",
+            "embedding_identity": index_embedding_identity,
+            "embedding_base_url": (
+                embedding_status["base_url"] if not embedding_status["fallback_used"] else "offline_hash"
+            ),
             "vector_dimensions": vector_size,
             "rerank_mode": reranker_info["mode"],
             "rerank_score_policy": score_policy,
-            "vector_backend": vector_backend,
-            "qdrant_url": resolve_qdrant_url() if vector_backend == "qdrant" else "",
-            "qdrant_collection": resolve_qdrant_collection() if vector_backend == "qdrant" else "",
+            "requested_vector_backend": vector_backend,
+            "vector_backend": resolved_vector_backend,
+            "qdrant_url": resolve_qdrant_url() if resolved_vector_backend == "qdrant" else "",
+            "qdrant_collection": resolve_qdrant_collection() if resolved_vector_backend == "qdrant" else "",
         },
+        "component_status": component_status,
+        "fallbacks": fallback_summary(component_status),
         "index_sync": index_sync,
         "permission_filter": {
             "allowed_scopes": sorted(scopes),
@@ -1974,10 +2512,10 @@ def run_query(
         "stage_latencies_ms": stage_latencies_ms,
     }
     latency_ms = int((time.perf_counter() - started) * 1000)
-    trace["monitoring_event"] = build_monitoring_event(trace, latency_ms=latency_ms, status="ok")
+    monitoring_event = build_monitoring_event(trace, latency_ms=latency_ms, status="ok")
     if monitoring_enabled:
         try:
-            persist_monitoring_event(trace["monitoring_event"], metrics_path=metrics_path)
+            persist_monitoring_event(monitoring_event, metrics_path=metrics_path)
             trace["monitoring_metrics_path"] = str(metrics_path)
         except OSError as exc:
             trace["monitoring_write_error"] = str(exc)
@@ -2026,7 +2564,6 @@ def run_eval(
     *,
     allowed_scopes: set[str] | None = None,
     rebuild_index: bool = False,
-    real_models: bool = False,
     vector_backend: str = DEFAULT_VECTOR_BACKEND,
     monitoring_enabled: bool = True,
 ) -> None:
@@ -2038,7 +2575,6 @@ def run_eval(
             quiet=True,
             allowed_scopes=allowed_scopes,
             rebuild_index=rebuild_index and index == 0,
-            real_models=real_models,
             vector_backend=vector_backend,
             monitoring_enabled=monitoring_enabled,
         )
@@ -2072,11 +2608,6 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated permission scopes for the current user. Default: internal,public.",
     )
     parser.add_argument(
-        "--real-models",
-        action="store_true",
-        help="Use the configured LLM and embedding providers. Requires API keys.",
-    )
-    parser.add_argument(
         "--vector-backend",
         choices=("qdrant", "local"),
         default=DEFAULT_VECTOR_BACKEND,
@@ -2093,7 +2624,6 @@ def main() -> None:
         run_eval(
             allowed_scopes=scopes,
             rebuild_index=args.rebuild_index,
-            real_models=args.real_models,
             vector_backend=args.vector_backend,
             monitoring_enabled=not args.no_monitoring,
         )
@@ -2106,7 +2636,6 @@ def main() -> None:
         save_trace=args.save_trace,
         allowed_scopes=scopes,
         rebuild_index=args.rebuild_index,
-        real_models=args.real_models,
         vector_backend=args.vector_backend,
         monitoring_enabled=not args.no_monitoring,
     )

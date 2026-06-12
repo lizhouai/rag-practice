@@ -27,15 +27,14 @@
 
 | 模式 | 推荐用途 | 命令形态 | 使用的模型与存储 |
 | --- | --- | --- | --- |
-| 真实模型模式 | 主学习路径，观察真实 embedding、真实生成模型和 Qdrant 如何协同 | `python run_pipeline.py --query "你的问题" --real-models --rebuild-index` | 真实 embedding provider + 真实 LLM + Qdrant |
+| 真实模型模式 | 主学习路径，观察真实 embedding、真实生成模型和 Qdrant 如何协同 | `python run_pipeline.py --query "你的问题" --rebuild-index` | 真实 embedding provider + 真实 LLM + Qdrant |
 | 本地兜底模式 | 临时排障，验证非模型链路是否跑通 | `python run_pipeline.py --query "你的问题" --vector-backend local --rebuild-index` | 本地 hash embedding + 抽取式答案 + SQLite |
 
 推荐先跑真实模型模式。本地兜底模式只在 API Key、网络或 Qdrant 暂时不可用时使用，不用它评估真实召回质量、真实生成质量或最终用户体验。
 
-代码里有两个开关，但文档里建议只按上面两种稳定组合理解：
+默认命令会自动探测已配置的真实组件；LLM、embedding、Qdrant 或 rerank 不可用时，会分别降级并写入 trace。
 
-- `--real-models`：是否使用配置好的真实 embedding 和真实 LLM。
-- `--vector-backend`：向量存储走 `qdrant` 还是 `local`。
+- `--vector-backend`：请求向量存储走 `qdrant` 还是 `local`；请求 `qdrant` 失败时会自动降级到 SQLite。
 
 配套代码在本目录下：
 
@@ -124,6 +123,8 @@ ZHIPU_API_KEY=...
 EMBEDDING_BASE_URL=https://open.bigmodel.cn/api/paas/v4
 EMBEDDING_MODEL=embedding-3
 EMBEDDING_DIMENSIONS=1024
+# Optional: force index identity provider to local or external.
+# EMBEDDING_PROVIDER=external
 
 # 向量数据库
 QDRANT_URL=http://localhost:6333
@@ -173,10 +174,10 @@ QDRANT_API_KEY=your-qdrant-api-key
 
 ## 2. 先跑一次完整工程链路
 
-第一次运行时加 `--real-models --rebuild-index`，脚本会读取 `data/raw/`，切 parent / chunk，调用智谱 `embedding-3`，写入 Qdrant，再调用 DeepSeek V4 Pro 生成答案：
+第一次运行时加 `--rebuild-index`，脚本会读取 `data/raw/`，切 parent / chunk，调用智谱 `embedding-3`，写入 Qdrant，再调用 DeepSeek V4 Pro 生成答案：
 
 ```bash
-python run_pipeline.py --query "跨境订单退款多久到账？" --real-models --rebuild-index
+python run_pipeline.py --query "跨境订单退款多久到账？" --rebuild-index
 ```
 
 你会看到几类信息：
@@ -202,7 +203,7 @@ python run_pipeline.py --query "跨境订单退款多久到账？" --vector-back
 生产 RAG 的坏 case，不能只盯最终答案。先看完整 trace：
 
 ```bash
-python run_pipeline.py --query "SKU-A17 是否支持无理由退货？" --real-models --trace-only
+python run_pipeline.py --query "SKU-A17 是否支持无理由退货？" --trace-only
 ```
 
 trace 里最值得先看这些字段：
@@ -223,7 +224,7 @@ trace 里最值得先看这些字段：
 如果需要把完整 trace 保存下来：
 
 ```bash
-python run_pipeline.py --query "SKU-A17 是否支持无理由退货？" --real-models --save-trace
+python run_pipeline.py --query "SKU-A17 是否支持无理由退货？" --save-trace
 ```
 
 ## 4. 读懂代码里的 12 个环节
@@ -264,7 +265,9 @@ OVERLAP_CHARS = 60
 
 ### 第三步：增量同步索引
 
-`sync_index()` 会比较文档内容 hash 和 embedding 模型名，只重建发生变化的文档。
+`sync_index()` 会先确定实际 embedding identity，再比较文档内容 hash，只重建发生变化的文档。identity 会区分本地/外部方式和模型名，例如 `local:local-hash-embedding`、`local:nomic-embed-text` 或 `external:embedding-3`。
+
+本地 SQLite 存储会按 embedding identity 派生独立文件名，避免真实 embedding 索引和 hash fallback 索引互相覆盖。
 
 这解决的是 `mini_rag` 里很容易遇到的问题：文档改了，但索引还是旧的。
 
@@ -278,7 +281,7 @@ OVERLAP_CHARS = 60
 加 `--rebuild-index` 会强制重建整个 collection：
 
 ```bash
-python run_pipeline.py --query "跨境订单退款多久到账？" --real-models --rebuild-index
+python run_pipeline.py --query "跨境订单退款多久到账？" --rebuild-index
 ```
 
 ### 第四步：权限和生效时间过滤
@@ -300,13 +303,13 @@ internal,public
 试一个财务受限问题：
 
 ```bash
-python run_pipeline.py --query "FR-21 差异工单怎么处理？" --real-models --trace-only
+python run_pipeline.py --query "FR-21 差异工单怎么处理？" --trace-only
 ```
 
 默认权限下，系统应该拒答或提示权限不足。再带上财务 scope：
 
 ```bash
-python run_pipeline.py --query "FR-21 差异工单怎么处理？" --real-models --scopes finance_restricted --trace-only
+python run_pipeline.py --query "FR-21 差异工单怎么处理？" --scopes finance_restricted --trace-only
 ```
 
 这一步很关键：权限过滤必须发生在生成答案之前，不能指望 Prompt 告诉模型“不要泄露”就完事。
@@ -340,7 +343,7 @@ Index required but not found for "doc_id" of one of the following types: [keywor
 dense recall 擅长处理同义表达。比如用户问：
 
 ```bash
-python run_pipeline.py --query "跨境退款一般几天能回到卡里？" --real-models --trace-only
+python run_pipeline.py --query "跨境退款一般几天能回到卡里？" --trace-only
 ```
 
 即使文档不完全使用同一句话，也可能命中退款时效相关资料。
@@ -354,8 +357,8 @@ python run_pipeline.py --query "跨境退款一般几天能回到卡里？" --re
 它对这类问题尤其有用：
 
 ```bash
-python run_pipeline.py --query "SKU-A17 是否支持无理由退货？" --real-models --trace-only
-python run_pipeline.py --query "FR-21 差异工单怎么处理？" --real-models --trace-only
+python run_pipeline.py --query "SKU-A17 是否支持无理由退货？" --trace-only
+python run_pipeline.py --query "FR-21 差异工单怎么处理？" --trace-only
 ```
 
 如果只靠向量，`SKU-A17`、`FR-21` 这类 token 很容易被语义相似度稀释。BM25 的作用就是把这些“精确词”补回来。
@@ -476,7 +479,7 @@ RERANKER_TIMEOUT_SECONDS=30
 试一个知识库外的问题：
 
 ```bash
-python run_pipeline.py --query "今天北京天气怎么样？" --real-models --trace-only
+python run_pipeline.py --query "今天北京天气怎么样？" --trace-only
 ```
 
 理想结果不是硬答天气，而是拒答。
@@ -529,7 +532,7 @@ python run_pipeline.py --query "跨境订单退款多久到账？" --vector-back
 运行内置评测集：
 
 ```bash
-python run_pipeline.py --eval --real-models --rebuild-index
+python run_pipeline.py --eval --rebuild-index
 ```
 
 评测用例在 `eval_cases.csv` 里，当前覆盖：
@@ -548,8 +551,8 @@ python run_pipeline.py --eval --real-models --rebuild-index
 也可以逐条手工看 trace：
 
 ```bash
-python run_pipeline.py --query "会员积分可以提现吗？" --real-models --trace-only
-python run_pipeline.py --query "今天北京天气怎么样？" --real-models --trace-only
+python run_pipeline.py --query "会员积分可以提现吗？" --trace-only
+python run_pipeline.py --query "今天北京天气怎么样？" --trace-only
 ```
 
 记录时不要只写“答案对 / 错”，建议至少记这几列：
@@ -571,7 +574,7 @@ python run_pipeline.py --query "今天北京天气怎么样？" --real-models --
 然后运行：
 
 ```bash
-python run_pipeline.py --query "跨境订单退款多久到账？" --real-models --trace-only
+python run_pipeline.py --query "跨境订单退款多久到账？" --trace-only
 ```
 
 观察 `index_sync.changed_docs`。如果只改了这一篇，理论上只应该重建对应文档。
@@ -579,7 +582,7 @@ python run_pipeline.py --query "跨境订单退款多久到账？" --real-models
 再运行一次同样命令：
 
 ```bash
-python run_pipeline.py --query "跨境订单退款多久到账？" --real-models --trace-only
+python run_pipeline.py --query "跨境订单退款多久到账？" --trace-only
 ```
 
 第二次 `changed_docs` 应该为空，因为索引已经是最新状态。
@@ -591,13 +594,13 @@ python run_pipeline.py --query "跨境订单退款多久到账？" --real-models
 先问一个偏语义表达的问题：
 
 ```bash
-python run_pipeline.py --query "跨境退款一般几天能回到卡里？" --real-models --trace-only
+python run_pipeline.py --query "跨境退款一般几天能回到卡里？" --trace-only
 ```
 
 再问一个偏精确标识的问题：
 
 ```bash
-python run_pipeline.py --query "SKU-A17 是否支持无理由退货？" --real-models --trace-only
+python run_pipeline.py --query "SKU-A17 是否支持无理由退货？" --trace-only
 ```
 
 对比 `dense_top` 和 `bm25_top`。你会看到两条召回路径的强项不一样。
@@ -609,13 +612,13 @@ python run_pipeline.py --query "SKU-A17 是否支持无理由退货？" --real-m
 默认权限下问财务受限问题：
 
 ```bash
-python run_pipeline.py --query "FR-21 差异工单怎么处理？" --real-models --trace-only
+python run_pipeline.py --query "FR-21 差异工单怎么处理？" --trace-only
 ```
 
 再带财务权限：
 
 ```bash
-python run_pipeline.py --query "FR-21 差异工单怎么处理？" --real-models --scopes finance_restricted --trace-only
+python run_pipeline.py --query "FR-21 差异工单怎么处理？" --scopes finance_restricted --trace-only
 ```
 
 观察 `permission_filter.rejected_chunks`、`permission_filter.blocked_matches` 和 `context_packet.sufficiency.reason`。
@@ -627,7 +630,7 @@ python run_pipeline.py --query "FR-21 差异工单怎么处理？" --real-models
 每次查询默认会追加一行 JSONL monitoring event：
 
 ```bash
-python run_pipeline.py --query "SKU-A17 是否支持无理由退货？" --real-models
+python run_pipeline.py --query "SKU-A17 是否支持无理由退货？"
 ```
 
 默认路径类似：
@@ -645,7 +648,7 @@ RAG_RUNTIME_DIR=C:\tmp\production_rag_runtime
 monitoring event 会记录：
 
 - `trace_id`、`latency_ms`、`status`；
-- `vector_backend`、`embedding_model`、`qdrant_collection`；
+- `vector_backend`、`embedding_model`、`embedding_identity`、`qdrant_collection`；
 - `query_hash` 和 `query_chars`，默认不记录完整 query；
 - dense / BM25 / rerank 命中数量；
 - MMR 近重复丢弃数量；
@@ -661,7 +664,7 @@ monitoring event 会记录：
 如果只想临时跑命令，不写 monitoring event：
 
 ```bash
-python run_pipeline.py --query "SKU-A17 是否支持无理由退货？" --real-models --no-monitoring
+python run_pipeline.py --query "SKU-A17 是否支持无理由退货？" --no-monitoring
 ```
 
 生产系统不应该把完整用户问题随手写进监控日志。这个项目默认写 `query_hash`，就是为了保留排障线索，同时减少敏感信息暴露。
@@ -751,12 +754,12 @@ ZHIPU_API_KEY
 也可以强制重建：
 
 ```bash
-python run_pipeline.py --query "你的问题" --real-models --rebuild-index
+python run_pipeline.py --query "你的问题" --rebuild-index
 ```
 
 ### 检索结果看起来不相关
 
-先用 `--real-models --trace-only` 看链路，而不是直接改 Prompt：
+先用 `--trace-only` 看链路，而不是直接改 Prompt：
 
 - `dense_top` 是否命中语义相关证据；
 - `bm25_top` 是否命中关键词证据；
