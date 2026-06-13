@@ -30,6 +30,7 @@ from rag.vectorstore.sqlite import *  # noqa: F401,F403
 from rag.vectorstore.qdrant import *  # noqa: F401,F403
 from rag.vectorstore.mirrored import *  # noqa: F401,F403
 from rag.embedding import *  # noqa: F401,F403
+from rag.retrieval import *  # noqa: F401,F403
 
 
 @dataclass
@@ -109,12 +110,6 @@ def extract_anthropic_text(payload: dict) -> str:
         if isinstance(block, dict) and block.get("type") == "text" and isinstance(block.get("text"), str):
             texts.append(block["text"])
     return "".join(texts)
-
-
-def cosine(left: list[float], right: list[float]) -> float:
-    if not left or not right:
-        return 0.0
-    return sum(a * b for a, b in zip(left, right))
 
 
 def build_corpus() -> tuple[list[ParentSection], list[Chunk]]:
@@ -421,62 +416,6 @@ def sync_index(
         "rebuild_requested": rebuild,
         "reason": "rebuilt" if rebuild else "incremental_sync",
     }
-
-
-def dense_recall(query_vector: list[float], chunks: list[Chunk], top_n: int = DENSE_TOP_N) -> list[tuple[float, Chunk]]:
-    scored = [(cosine(query_vector, chunk.dense_vector), chunk) for chunk in chunks]
-    return sorted(scored, key=lambda item: item[0], reverse=True)[:top_n]
-
-
-def bm25_recall(query: str, chunks: list[Chunk], top_n: int = BM25_TOP_N) -> list[tuple[float, Chunk]]:
-    query_terms = tokenize(query)
-    if not query_terms:
-        return []
-
-    doc_freq: Counter[str] = Counter()
-    chunk_terms = {chunk.chunk_id: Counter(chunk.terms) for chunk in chunks}
-    for counts in chunk_terms.values():
-        for term in counts:
-            doc_freq[term] += 1
-
-    avg_len = sum(sum(counts.values()) for counts in chunk_terms.values()) / max(1, len(chunks))
-    total_docs = len(chunks)
-    k1 = 1.5
-    b = 0.75
-    scores: list[tuple[float, Chunk]] = []
-
-    for chunk in chunks:
-        counts = chunk_terms[chunk.chunk_id]
-        length = sum(counts.values()) or 1
-        score = 0.0
-        for term in query_terms:
-            tf = counts.get(term, 0)
-            if tf == 0:
-                continue
-            idf = math.log(1 + (total_docs - doc_freq[term] + 0.5) / (doc_freq[term] + 0.5))
-            score += idf * (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * length / avg_len))
-        if score > 0:
-            scores.append((score, chunk))
-
-    return sorted(scores, key=lambda item: item[0], reverse=True)[:top_n]
-
-
-def rrf_fuse(
-    dense_results: list[tuple[float, Chunk]],
-    bm25_results: list[tuple[float, Chunk]],
-) -> dict[str, Candidate]:
-    candidates: dict[str, Candidate] = {}
-    for route, results in (("dense", dense_results), ("bm25", bm25_results)):
-        for rank, (score, chunk) in enumerate(results, start=1):
-            item = candidates.setdefault(chunk.chunk_id, Candidate(chunk_id=chunk.chunk_id))
-            item.rrf_score += 1 / (RRF_K + rank)
-            if route == "dense":
-                item.dense_rank = rank
-                item.dense_score = score
-            else:
-                item.bm25_rank = rank
-                item.bm25_score = score
-    return dict(sorted(candidates.items(), key=lambda pair: pair[1].rrf_score, reverse=True))
 
 
 def parse_reranker_scores(payload: dict, expected_count: int) -> list[float]:
@@ -1152,18 +1091,6 @@ def append_jsonl(path: Path, item: dict) -> None:
 
 def persist_monitoring_event(event: dict, metrics_path: Path = METRICS_PATH) -> None:
     append_jsonl(metrics_path, event)
-
-
-def summarize_results(results: Iterable[tuple[float, Chunk]]) -> list[dict]:
-    return [
-        {
-            "score": round(score, 4),
-            "chunk_id": chunk.chunk_id,
-            "doc_id": chunk.doc_id,
-            "title_path": " > ".join(chunk.title_path),
-        }
-        for score, chunk in results
-    ]
 
 
 def build_llm_status() -> dict:
