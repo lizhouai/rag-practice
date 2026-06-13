@@ -28,6 +28,7 @@ from rag.chunking import *  # noqa: F401,F403
 from rag.vectorstore.filters import *  # noqa: F401,F403
 from rag.vectorstore.sqlite import *  # noqa: F401,F403
 from rag.vectorstore.qdrant import *  # noqa: F401,F403
+from rag.vectorstore.mirrored import *  # noqa: F401,F403
 from rag.embedding import *  # noqa: F401,F403
 
 
@@ -108,40 +109,6 @@ def extract_anthropic_text(payload: dict) -> str:
         if isinstance(block, dict) and block.get("type") == "text" and isinstance(block.get("text"), str):
             texts.append(block["text"])
     return "".join(texts)
-
-
-class MirroredVectorStore:
-    def __init__(self, primary: object, mirror: LocalVectorStore) -> None:
-        self.primary = primary
-        self.mirror = mirror
-
-    def describe(self) -> str:
-        return self.primary.describe() if hasattr(self.primary, "describe") else str(self.primary)
-
-    def reset(self) -> None:
-        self.primary.reset()
-        self.mirror.reset()
-
-    def load_manifest(self) -> dict[str, dict[str, str]]:
-        return self.primary.load_manifest()
-
-    def upsert_document(
-        self,
-        doc_id: str,
-        source_path: str,
-        hash_value: str,
-        embedding_model: str,
-        chunks: list[Chunk],
-    ) -> None:
-        self.primary.upsert_document(doc_id, source_path, hash_value, embedding_model, chunks)
-        self.mirror.upsert_document(doc_id, source_path, hash_value, embedding_model, chunks)
-
-    def delete_documents(self, doc_ids: set[str]) -> None:
-        self.primary.delete_documents(doc_ids)
-        self.mirror.delete_documents(doc_ids)
-
-    def load_chunks(self) -> list[Chunk]:
-        return self.primary.load_chunks()
 
 
 def cosine(left: list[float], right: list[float]) -> float:
