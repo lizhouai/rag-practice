@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import json
+import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
-import time
 
 from rag.config import DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_BACKOFF_SECONDS
 
@@ -73,6 +74,14 @@ def request_json(
         raise RuntimeError(f"API request failed for {method} {url}: HTTP {exc.code} {error_body}") from exc
     except urllib.error.URLError as exc:
         raise RuntimeError(f"API request failed for {method} {url}: {format_transport_error(url, exc.reason)}") from exc
+
+
+def post_json(url: str, body: dict[str, object], headers: dict[str, str] | None = None) -> dict:
+    # During Phase 1, tests patch run_pipeline.request_json through the shim.
+    # Keep that patch point alive while the transport helper lives in rag.http.
+    shim = sys.modules.get("run_pipeline")
+    request_json_func = getattr(shim, "request_json", request_json) if shim is not None else request_json
+    return request_json_func("POST", url, body=body, headers=headers)
 
 
 def format_transport_error(url: str, reason: object) -> str:
