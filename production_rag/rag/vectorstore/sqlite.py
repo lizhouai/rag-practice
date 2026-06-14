@@ -63,6 +63,7 @@ class LocalVectorStore:
             """
         )
         connection.execute("CREATE INDEX IF NOT EXISTS idx_chunks_doc_id ON chunks(doc_id)")
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_chunks_parent_id ON chunks(parent_id)")
         for column_name, column_type in {
             "permission_scope": "TEXT NOT NULL DEFAULT ''",
             "effective_from": "TEXT NOT NULL DEFAULT ''",
