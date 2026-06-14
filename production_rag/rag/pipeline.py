@@ -16,6 +16,7 @@ from rag.config import METRICS_PATH, MMR_LAMBDA, PARENT_EXPANSION_MAX_CHARS, TRA
 from rag.config import embedding_identity, local_store_path_for_embedding_identity
 from rag.config import resolve_qdrant_collection, resolve_qdrant_url, resolve_vector_dimensions
 from rag.context import assemble_context, sufficiency_check
+from rag.docstore import SqliteDocstore
 from rag.embedding import build_embedding_status, make_retrying_embedding_function
 from rag.generation import build_llm_status, generate_answer_resilient, validate_citations
 from rag.http import ComponentFallback, RetryExhausted, call_with_retries
@@ -60,6 +61,33 @@ def _print_answer(trace: dict, trace_path: Path | None) -> None:
     print(trace["answer"]["answer"])
     print("\nValidation:")
     print(json.dumps(trace["validation"], ensure_ascii=False, indent=2))
+
+
+def _hydrate_recall_results(
+    results: list[tuple[float, Chunk]],
+    hydrated_chunks: dict[str, Chunk],
+    chunks_by_id: dict[str, Chunk],
+) -> list[tuple[float, Chunk]]:
+    hydrated_results: list[tuple[float, Chunk]] = []
+    for score, recalled in results:
+        source = hydrated_chunks.get(recalled.chunk_id)
+        if source is None:
+            chunk = recalled
+        else:
+            chunk = Chunk(
+                chunk_id=source.chunk_id,
+                parent_id=source.parent_id,
+                doc_id=source.doc_id,
+                title_path=list(source.title_path),
+                text=source.text,
+                metadata=dict(source.metadata),
+                token_count=source.token_count,
+                dense_vector=recalled.dense_vector or source.dense_vector,
+                terms=list(source.terms),
+            )
+        chunks_by_id[chunk.chunk_id] = chunk
+        hydrated_results.append((score, chunk))
+    return hydrated_results
 
 
 def run_query(
@@ -181,33 +209,7 @@ def run_query(
     stage_latencies_ms["index_sync"] = int((time.perf_counter() - stage_started) * 1000)
 
     def load_access_state():
-        nonlocal index_sync, resolved_vector_backend, vector_store, lexical_store
-
-        def load_access_chunks() -> tuple[list[Chunk], list[dict], list[Chunk]]:
-            if resolved_vector_backend == "qdrant":
-                loaded, attempts = call_with_retries(lambda: vector_store.load_access_chunks(scopes))
-                vector_store_status["attempts"] = max(vector_store_status.get("attempts", 0), attempts)
-                return loaded
-            return lexical_store.load_access_chunks(scopes)
-
-        try:
-            visible_chunks, rejected, permission_blocked_chunks = load_access_chunks()
-        except RetryExhausted as exc:
-            if resolved_vector_backend != "qdrant":
-                raise
-            set_vector_store_fallback(vector_store_status, str(exc), exc.attempts)
-            lexical_store = LocalVectorStore(active_store_path)
-            vector_store = lexical_store
-            resolved_vector_backend = "local"
-            index_sync = index_status_without_rebuild(
-                vector_store=lexical_store,
-                store_path=active_store_path,
-                embedding_model=embedding_model,
-                embedding_identity_value=index_embedding_identity,
-                reason="qdrant_load_fallback",
-            )
-            visible_chunks, rejected, permission_blocked_chunks = lexical_store.load_access_chunks(scopes)
-
+        visible_chunks, rejected, permission_blocked_chunks = lexical_store.load_access_chunks(scopes)
         access_checked_chunks = visible_chunks + permission_blocked_chunks
         blocked_matches = find_permission_blocked_matches(query, access_checked_chunks, rejected)
         visible_chunks_by_id = {chunk.chunk_id: chunk for chunk in visible_chunks}
@@ -224,15 +226,24 @@ def run_query(
         )
 
     stage_started = time.perf_counter()
-    (
-        all_chunks,
-        chunks,
-        rejected_chunks,
-        permission_blocked_matches,
-        parents_count,
-        chunks_by_id,
-        chunks_by_parent,
-    ) = load_access_state()
+    if resolved_vector_backend == "qdrant":
+        all_chunks = []
+        chunks = []
+        rejected_chunks = []
+        permission_blocked_matches = []
+        parents_count = 0
+        chunks_by_id = {}
+        chunks_by_parent = {}
+    else:
+        (
+            all_chunks,
+            chunks,
+            rejected_chunks,
+            permission_blocked_matches,
+            parents_count,
+            chunks_by_id,
+            chunks_by_parent,
+        ) = load_access_state()
     stage_latencies_ms["access_filter"] = int((time.perf_counter() - stage_started) * 1000)
 
     stage_started = time.perf_counter()
@@ -293,15 +304,11 @@ def run_query(
     if resolved_vector_backend == "qdrant":
         try:
             dense_results, attempts = call_with_retries(
-                lambda: [
-                    (score, chunk)
-                    for score, chunk in vector_store.search(
-                        query_vector,
-                        DENSE_TOP_N,
-                        access_filter=qdrant_access_filter(scopes),
-                    )
-                    if chunk.chunk_id in chunks_by_id
-                ]
+                lambda: vector_store.search(
+                    query_vector,
+                    DENSE_TOP_N,
+                    access_filter=qdrant_access_filter(scopes),
+                )
             )
             vector_store_status["attempts"] = max(vector_store_status.get("attempts", 0), attempts)
         except RetryExhausted as exc:
@@ -363,15 +370,31 @@ def run_query(
     else:
         bm25_results = lexical_store.bm25_search(query, scopes)
     stage_latencies_ms["bm25_recall"] = int((time.perf_counter() - stage_started) * 1000)
-    for _, chunk in bm25_results:
-        chunks_by_id.setdefault(chunk.chunk_id, chunk)
-    # The qdrant access snapshot is loaded without vectors; recall results carry
-    # the dense vectors MMR needs, so backfill them onto the shared chunks.
-    for _, chunk in [*dense_results, *bm25_results]:
-        stored = chunks_by_id.get(chunk.chunk_id)
-        if stored is not None and not stored.dense_vector and chunk.dense_vector:
-            stored.dense_vector = chunk.dense_vector
+
+    stage_started = time.perf_counter()
+    if resolved_vector_backend == "qdrant":
+        candidate_ids = [chunk.chunk_id for _, chunk in [*dense_results, *bm25_results]]
+        docstore = SqliteDocstore(active_store_path)
+        hydrated_chunks = docstore.hydrate(candidate_ids)
+        chunks_by_id = {}
+        dense_results = _hydrate_recall_results(dense_results, hydrated_chunks, chunks_by_id)
+        bm25_results = _hydrate_recall_results(bm25_results, hydrated_chunks, chunks_by_id)
+        chunks = list(chunks_by_id.values())
+        all_chunks = chunks
+        rejected_chunks = []
+        permission_blocked_matches = []
+        parents_count = len({chunk.parent_id for chunk in chunks})
+        if not index_sync.get("chunks_count"):
+            index_sync["chunks_count"] = len(chunks)
+    else:
+        for _, chunk in bm25_results:
+            chunks_by_id.setdefault(chunk.chunk_id, chunk)
+        for _, chunk in [*dense_results, *bm25_results]:
+            stored = chunks_by_id.get(chunk.chunk_id)
+            if stored is not None and not stored.dense_vector and chunk.dense_vector:
+                stored.dense_vector = chunk.dense_vector
     chunks_by_parent = build_chunks_by_parent(list(chunks_by_id.values()))
+    stage_latencies_ms["docstore_hydrate"] = int((time.perf_counter() - stage_started) * 1000)
 
     stage_started = time.perf_counter()
     fused = rrf_fuse(dense_results, bm25_results)
