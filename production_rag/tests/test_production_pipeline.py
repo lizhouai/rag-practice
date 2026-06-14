@@ -1341,6 +1341,8 @@ class QdrantVectorStoreTest(unittest.TestCase):
                 else:
                     points = []
                 return {"result": {"points": points, "next_page_offset": None}}
+            if url.endswith("/points/count"):
+                return {"result": {"count": 0}}
             if url.endswith("/points/query") and body["using"] == rag.QDRANT_DENSE_VECTOR_NAME:
                 return {
                     "result": {

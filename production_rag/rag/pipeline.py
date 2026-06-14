@@ -29,7 +29,7 @@ from rag.monitoring import persist_monitoring_event as _persist_monitoring_event
 from rag.rerank import describe_reranker, make_configured_external_reranker, rerank
 from rag.retrieval import dense_recall, rrf_fuse, summarize_results
 from rag.selection import build_chunks_by_parent, dynamic_truncate, mmr_select
-from rag.vectorstore.filters import qdrant_access_filter
+from rag.vectorstore.filters import qdrant_access_filter, qdrant_expired_filter, qdrant_not_yet_effective_filter
 from rag.vectorstore.sqlite import LocalVectorStore
 
 __all__ = ["run_query"]
@@ -90,6 +90,15 @@ def _hydrate_recall_results(
     return hydrated_results
 
 
+def _time_rejected_counts(rejected_chunks: list[dict]) -> dict[str, int]:
+    counts = {"expired": 0, "not_yet_effective": 0}
+    for item in rejected_chunks:
+        reason = item.get("reason")
+        if reason in counts:
+            counts[reason] += 1
+    return counts
+
+
 def run_query(
     query: str,
     trace_only: bool = False,
@@ -108,6 +117,7 @@ def run_query(
     llm_status = build_llm_status()
     embedding_status = build_embedding_status()
     vector_store_status: dict = {}
+    rejected_counts = {"expired": 0, "not_yet_effective": 0}
     scopes = allowed_scopes or DEFAULT_ALLOWED_SCOPES
     vector_size = resolve_vector_dimensions()
     embedder = make_retrying_embedding_function(embedding_status, vector_size) if embedding_status["configured"] else None
@@ -386,6 +396,10 @@ def run_query(
         parents_count = len({chunk.parent_id for chunk in chunks})
         if not index_sync.get("chunks_count"):
             index_sync["chunks_count"] = len(chunks)
+        rejected_counts = {
+            "expired": vector_store.count(qdrant_expired_filter(scopes)),
+            "not_yet_effective": vector_store.count(qdrant_not_yet_effective_filter(scopes)),
+        }
     else:
         for _, chunk in bm25_results:
             chunks_by_id.setdefault(chunk.chunk_id, chunk)
@@ -393,6 +407,7 @@ def run_query(
             stored = chunks_by_id.get(chunk.chunk_id)
             if stored is not None and not stored.dense_vector and chunk.dense_vector:
                 stored.dense_vector = chunk.dense_vector
+        rejected_counts = _time_rejected_counts(rejected_chunks)
     chunks_by_parent = build_chunks_by_parent(list(chunks_by_id.values()))
     stage_latencies_ms["docstore_hydrate"] = int((time.perf_counter() - stage_started) * 1000)
 
@@ -495,6 +510,7 @@ def run_query(
         "permission_filter": {
             "allowed_scopes": sorted(scopes),
             "visible_chunks": len(chunks),
+            "rejected_counts": rejected_counts,
             "rejected_chunks": rejected_chunks,
             "blocked_matches": permission_blocked_matches,
         },
