@@ -3,3 +3,4 @@
 __pycache__/
 traces/
 trace_output/*.json
+docs/
