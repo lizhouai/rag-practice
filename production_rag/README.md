@@ -38,7 +38,8 @@
 
 配套代码在本目录下：
 
-- `run_pipeline.py`：完整 production_rag 练习主链路。
+- `run_pipeline.py`：薄 CLI 入口，只负责参数解析、加载 `.env`、运行单条查询或 eval。
+- `rag/`：生产风格 RAG 主链路包，按职责拆分检索、索引、上下文、生成和监控。
 - `data/raw/`：样例客服知识库。
 - `eval_cases.csv`：小型 golden set。
 - `docker-compose.yml`：本地 Qdrant 启动配置。
@@ -48,6 +49,21 @@
 - `scripts/import_customer_support_dataset.py`：可选数据集导入脚本。
 - `data/DATASET_SOURCES.md`：数据来源和取舍说明。
 - `tests/`：权限、手动索引重建、Qdrant、模型请求、引用校验和监控测试。
+
+`rag/` 包的核心模块如下：
+
+| 模块 | 职责 |
+| --- | --- |
+| `config.py` | 环境变量、路径、默认阈值和 embedding / Qdrant 配置解析 |
+| `models.py` | `ParentSection`、`Chunk`、`Candidate` 等数据结构 |
+| `chunking.py` | frontmatter 解析、parent section / child chunk 切分、tokenize / vectorize |
+| `embedding.py`、`http.py` | embedding / LLM / reranker 请求的 HTTP、重试和 fallback 原语 |
+| `vectorstore/` | Qdrant、SQLite、本地镜像存储和 Qdrant filter 构造 |
+| `docstore.py` | SQLite 文本仓库，按 chunk id hydrate，并按 parent id 取 sibling chunks |
+| `indexing.py` | 原始文档到向量库和 docstore 的索引同步 |
+| `retrieval.py`、`rerank.py`、`selection.py` | dense / BM25 召回、RRF、rerank、MMR、动态截断 |
+| `context.py`、`generation.py` | context packet、资料充足性判断、答案生成和引用校验 |
+| `access.py`、`monitoring.py`、`pipeline.py` | 权限提示、监控事件和查询编排 |
 
 ## 0. 先说做成什么样
 
@@ -78,6 +94,21 @@ Markdown 文档
   -> 引用校验
   -> trace + monitoring event
 ```
+
+模块化后的 Qdrant 查询主路径是 retrieve-then-hydrate：
+
+```text
+run_pipeline.py CLI
+  -> rag.pipeline.run_query()
+  -> Qdrant dense + bm25 查询，权限和生效期 filter 下推到检索层
+  -> Qdrant 只返回候选 chunk metadata，不从 payload 取 text / terms
+  -> SqliteDocstore.hydrate(candidate_ids) 补回候选文本和 terms
+  -> RRF / rerank / MMR
+  -> SqliteDocstore.siblings(parent_ids) 补 parent 邻近 chunk
+  -> 动态截断、context packet、生成、引用校验、trace
+```
+
+这样 Qdrant 路径不需要在每次查询时全量 scroll collection；文本正文留在本地 docstore，向量库负责候选召回和过滤。
 
 它的重点不是“多堆几个模块”，而是让你看到：生产 RAG 的难点往往不在某一次模型调用，而在证据从原始文档到最终答案的整条链路。
 
@@ -219,6 +250,14 @@ trace 里最值得先看这些字段：
 - `context_packet`：真正交给答案生成器的证据包。
 - `validation`：答案里的引用是否有效。
 
+默认 trace 不会额外搜索用户无权访问的标题。如果你想在权限拒答场景里看到“哪些被挡住的标题和 query 有关”，显式加 `--blocked-hint`：
+
+```bash
+python run_pipeline.py --query "FR-21 差异工单怎么处理？" --trace-only --blocked-hint
+```
+
+这个开关只用于排障；默认关闭，避免每次查询都额外探测受限资料。
+
 这一步对应真实线上排障：当用户说“答错了”，你要先判断是没召回、召回了但没排上去、排上去了但被截掉、进入上下文了但答案没用，还是引用校验没兜住。
 
 如果需要把完整 trace 保存下来：
@@ -229,7 +268,7 @@ python run_pipeline.py --query "SKU-A17 是否支持无理由退货？" --save-t
 
 ## 4. 读懂代码里的 12 个环节
 
-打开 `run_pipeline.py`，按下面顺序看。
+先从 `rag/pipeline.py` 的 `run_query()` 看整体编排，再按下面顺序跳到对应模块。`run_pipeline.py` 现在只是 CLI 包装层，不再 re-export 包内实现。
 
 ### 第一步：读取带 metadata 的文档
 
@@ -324,7 +363,7 @@ QDRANT_URL = http://localhost:6333
 QDRANT_COLLECTION = production_rag_chunks
 ```
 
-`QdrantVectorStore` 负责创建 collection、写入 points、查询 points，并为 `doc_id` 创建 payload index。每个 point 会同时写入 named dense vector 和 `bm25` sparse vector；手动重建需要按 `doc_id` 删除旧 chunk，所以这个 payload index 不是可有可无。
+`QdrantVectorStore` 负责创建 collection、写入 points、查询 points，并为 `doc_id` 创建 payload index。每个 point 会同时写入 named dense vector 和 `bm25` sparse vector；payload 只保留检索和审计需要的 metadata，不再存正文 `text` 或 `terms`。手动重建需要按 `doc_id` 删除旧 chunk，所以这个 payload index 不是可有可无。
 
 如果看到：
 
