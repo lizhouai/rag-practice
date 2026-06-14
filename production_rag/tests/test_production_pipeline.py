@@ -1204,6 +1204,38 @@ class QdrantVectorStoreTest(unittest.TestCase):
         self.assertEqual(results[0][1].chunk_id, "chunk-1")
         self.assertEqual(results[0][1].dense_vector, [0.3, 0.4])
 
+    def test_count_posts_filtered_count_request(self) -> None:
+        captured: dict[str, object] = {}
+
+        class FakeResponse:
+            def __enter__(self) -> "FakeResponse":
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return b'{"result":{"count":7}}'
+
+        def fake_urlopen(request: urllib.request.Request, timeout: int) -> FakeResponse:
+            captured["url"] = request.full_url
+            captured["body"] = request.data
+            return FakeResponse()
+
+        store = rag.QdrantVectorStore(
+            base_url="http://qdrant.test",
+            collection_name="rag_test",
+            vector_size=64,
+        )
+        with patch("urllib.request.urlopen", fake_urlopen):
+            count = store.count(rag.qdrant_expired_filter({"internal"}, "2026-06-07"))
+
+        body = json.loads(captured["body"].decode("utf-8"))
+        self.assertEqual(captured["url"], "http://qdrant.test/collections/rag_test/points/count")
+        self.assertEqual(body["filter"], rag.qdrant_expired_filter({"internal"}, "2026-06-07"))
+        self.assertEqual(body["exact"], True)
+        self.assertEqual(count, 7)
+
     @staticmethod
     def classify_scroll_filter(access_filter: dict) -> str:
         rendered = json.dumps(access_filter)

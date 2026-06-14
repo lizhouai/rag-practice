@@ -433,3 +433,17 @@ class QdrantVectorStore:
                 )
             )
         return scored
+
+    def count(self, access_filter: dict | None = None) -> int:
+        body: dict[str, object] = {"exact": True}
+        if access_filter is not None:
+            body["filter"] = access_filter
+        payload = request_json(
+            "POST",
+            self.collection_url("/points/count"),
+            body=body,
+            headers=self.headers(),
+            ok_statuses=(200,),
+        )
+        result = payload.get("result", {})
+        return int(result.get("count", 0)) if isinstance(result, dict) else 0
