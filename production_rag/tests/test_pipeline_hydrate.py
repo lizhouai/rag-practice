@@ -250,6 +250,84 @@ class PipelineHydrateTest(unittest.TestCase):
                 )
         self.assertEqual(trace["permission_filter"]["rejected_counts"], {"expired": 3, "not_yet_effective": 2})
 
+    def test_visible_count_from_count_api(self) -> None:
+        def fake_request_json(method, url, body=None, headers=None, ok_statuses=(200,)):
+            if method == "GET" and url.endswith("/collections/rag_test"):
+                return {
+                    "result": {
+                        "payload_schema": {name: {} for name in rag.QDRANT_PAYLOAD_INDEXES},
+                        "config": {"params": {"sparse_vectors": {rag.QDRANT_BM25_VECTOR_NAME: {}}}},
+                    }
+                }
+            if url.endswith("/points/count"):
+                rendered = json.dumps(body["filter"])
+                if '"lt"' in rendered:
+                    return {"result": {"count": 3}}
+                if '"gt"' in rendered:
+                    return {"result": {"count": 2}}
+                return {"result": {"count": 87}}
+            if url.endswith("/points/query") and body.get("using") == rag.QDRANT_DENSE_VECTOR_NAME:
+                return {
+                    "result": {
+                        "points": [
+                            {
+                                "id": 1,
+                                "score": 0.9,
+                                "vector": {"dense": [1.0, 0.0]},
+                                "payload": {
+                                    "chunk_id": "c1",
+                                    "parent_id": "p1",
+                                    "doc_id": "d1",
+                                    "title_path": ["t"],
+                                    "token_count": 5,
+                                    "permission_scopes": ["internal"],
+                                },
+                            }
+                        ]
+                    }
+                }
+            if url.endswith("/points/query"):
+                return {"result": {"points": []}}
+            raise AssertionError(f"unexpected request {method} {url}")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store_path = Path(tmp) / "rag.sqlite"
+            active_store_path = _active_local_store_path(store_path)
+            rag.LocalVectorStore(active_store_path).upsert_document(
+                "d1",
+                "d.md",
+                "h",
+                "local:test",
+                [
+                    rag.Chunk(
+                        chunk_id="c1",
+                        parent_id="p1",
+                        doc_id="d1",
+                        title_path=["t"],
+                        text="x",
+                        metadata={"permission_scope": "internal"},
+                        token_count=5,
+                        dense_vector=[1.0, 0.0],
+                        terms=rag.tokenize("x"),
+                    )
+                ],
+            )
+            with (
+                patch.dict(os.environ, {"QDRANT_URL": "http://qdrant.test", "QDRANT_COLLECTION": "rag_test"}, clear=True),
+                patch.object(rag, "request_json", fake_request_json),
+            ):
+                trace = rag.run_query(
+                    "x",
+                    quiet=True,
+                    vector_backend="qdrant",
+                    store_path=store_path,
+                    metrics_path=Path(tmp) / "m.jsonl",
+                )
+
+        self.assertEqual(trace["chunks_count"], 87)
+        self.assertEqual(trace["permission_filter"]["visible_chunks"], 87)
+        self.assertEqual(trace["parents_count"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

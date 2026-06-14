@@ -118,6 +118,7 @@ def run_query(
     embedding_status = build_embedding_status()
     vector_store_status: dict = {}
     rejected_counts = {"expired": 0, "not_yet_effective": 0}
+    visible_chunks_count = 0
     scopes = allowed_scopes or DEFAULT_ALLOWED_SCOPES
     vector_size = resolve_vector_dimensions()
     embedder = make_retrying_embedding_function(embedding_status, vector_size) if embedding_status["configured"] else None
@@ -394,8 +395,9 @@ def run_query(
         rejected_chunks = []
         permission_blocked_matches = []
         parents_count = len({chunk.parent_id for chunk in chunks})
+        visible_chunks_count = vector_store.count(qdrant_access_filter(scopes))
         if not index_sync.get("chunks_count"):
-            index_sync["chunks_count"] = len(chunks)
+            index_sync["chunks_count"] = visible_chunks_count
         rejected_counts = {
             "expired": vector_store.count(qdrant_expired_filter(scopes)),
             "not_yet_effective": vector_store.count(qdrant_not_yet_effective_filter(scopes)),
@@ -408,6 +410,7 @@ def run_query(
             if stored is not None and not stored.dense_vector and chunk.dense_vector:
                 stored.dense_vector = chunk.dense_vector
         rejected_counts = _time_rejected_counts(rejected_chunks)
+        visible_chunks_count = len(chunks)
     chunks_by_parent = build_chunks_by_parent(list(chunks_by_id.values()))
     stage_latencies_ms["docstore_hydrate"] = int((time.perf_counter() - stage_started) * 1000)
 
@@ -509,13 +512,13 @@ def run_query(
         "index_sync": index_sync,
         "permission_filter": {
             "allowed_scopes": sorted(scopes),
-            "visible_chunks": len(chunks),
+            "visible_chunks": visible_chunks_count,
             "rejected_counts": rejected_counts,
             "rejected_chunks": rejected_chunks,
             "blocked_matches": permission_blocked_matches,
         },
         "parents_count": parents_count,
-        "chunks_count": len(chunks),
+        "chunks_count": visible_chunks_count,
         "dense_top": summarize_results(dense_results),
         "bm25_top": summarize_results(bm25_results),
         "rrf_top": [asdict(item) for item in list(fused.values())[:10]],
