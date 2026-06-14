@@ -115,6 +115,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--trace-only", action="store_true", help="Print the full JSON trace instead of the answer view.")
     parser.add_argument("--save-trace", action="store_true", help="Also save the full JSON trace.")
     parser.add_argument("--no-monitoring", action="store_true", help="Do not append the per-query monitoring event JSONL.")
+    parser.add_argument("--blocked-hint", action="store_true", help="Surface query-relevant blocked-title hints in the trace.")
     parser.add_argument("--eval", action="store_true", help="Run eval_cases.csv.")
     parser.add_argument("--rebuild-index", action="store_true", help="Force rebuilding the configured vector store.")
     parser.add_argument(
@@ -153,6 +154,7 @@ def main() -> None:
         rebuild_index=args.rebuild_index,
         vector_backend=args.vector_backend,
         monitoring_enabled=not args.no_monitoring,
+        blocked_hint=args.blocked_hint,
     )
 
 

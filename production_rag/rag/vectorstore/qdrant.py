@@ -400,6 +400,7 @@ class QdrantVectorStore:
         *,
         top_n: int = BM25_TOP_N,
         today: str | None = None,
+        access_filter: dict | None = None,
     ) -> list[tuple[float, Chunk]]:
         query_sparse = qdrant_sparse_vector_from_terms(tokenize(query))
         if not query_sparse["indices"]:
@@ -410,7 +411,7 @@ class QdrantVectorStore:
             "limit": top_n,
             "with_payload": True,
             "with_vector": [QDRANT_DENSE_VECTOR_NAME],
-            "filter": qdrant_access_filter(allowed_scopes, today),
+            "filter": access_filter if access_filter is not None else qdrant_access_filter(allowed_scopes, today),
         }
         payload = request_json(
             "POST",

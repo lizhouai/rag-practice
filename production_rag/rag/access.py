@@ -11,6 +11,7 @@ __all__ = [
     "is_effective",
     "filter_chunks_for_access",
     "find_permission_blocked_matches",
+    "query_driven_blocked_matches",
     "fallback_summary",
 ]
 
@@ -86,6 +87,37 @@ def find_permission_blocked_matches(
             }
         )
     return sorted(matches, key=lambda item: (item["overlap_ratio"], len(item["matched_terms"])), reverse=True)[:limit]
+
+
+def query_driven_blocked_matches(
+    query: str,
+    vector_store,
+    scopes: set[str],
+    docstore,
+    *,
+    top_n: int = 5,
+) -> list[dict]:
+    """Recall blocked-but-effective chunks relevant to this query, returning title hints only."""
+    from rag.vectorstore.filters import qdrant_permission_blocked_filter
+
+    tokenize_query = _shim_value("tokenize", tokenize)
+    if not tokenize_query(query):
+        return []
+    results = vector_store.bm25_search(
+        query,
+        scopes,
+        top_n=top_n,
+        access_filter=qdrant_permission_blocked_filter(scopes),
+    )
+    return [
+        {
+            "chunk_id": chunk.chunk_id,
+            "doc_id": chunk.doc_id,
+            "title_path": " > ".join(chunk.title_path),
+            "score": round(float(score), 4),
+        }
+        for score, chunk in results
+    ]
 
 
 def fallback_summary(component_status: dict[str, dict]) -> list[dict]:

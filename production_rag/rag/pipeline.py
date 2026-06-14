@@ -8,7 +8,7 @@ from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 
-from rag.access import fallback_summary, find_permission_blocked_matches
+from rag.access import fallback_summary, find_permission_blocked_matches, query_driven_blocked_matches
 from rag.chunking import tokenize, vectorize
 from rag.config import BM25_TOP_N, DEFAULT_ALLOWED_SCOPES, DEFAULT_LLM_API_STYLE, DEFAULT_VECTOR_BACKEND
 from rag.config import DEFAULT_VECTOR_DB_PATH, DENSE_TOP_N, EMBEDDING_PROVIDER_LOCAL, LOCAL_EMBEDDING_MODEL
@@ -111,6 +111,7 @@ def run_query(
     store_path: Path = DEFAULT_VECTOR_DB_PATH,
     monitoring_enabled: bool = True,
     metrics_path: Path = METRICS_PATH,
+    blocked_hint: bool = False,
 ) -> dict:
     started = time.perf_counter()
     stage_latencies_ms: dict[str, int] = {}
@@ -402,6 +403,11 @@ def run_query(
             "expired": vector_store.count(qdrant_expired_filter(scopes)),
             "not_yet_effective": vector_store.count(qdrant_not_yet_effective_filter(scopes)),
         }
+        permission_blocked_matches = (
+            query_driven_blocked_matches(query, vector_store, scopes, docstore)
+            if blocked_hint
+            else []
+        )
     else:
         for _, chunk in bm25_results:
             chunks_by_id.setdefault(chunk.chunk_id, chunk)
@@ -410,6 +416,8 @@ def run_query(
             if stored is not None and not stored.dense_vector and chunk.dense_vector:
                 stored.dense_vector = chunk.dense_vector
         rejected_counts = _time_rejected_counts(rejected_chunks)
+        if not blocked_hint:
+            permission_blocked_matches = []
         visible_chunks_count = len(chunks)
     chunks_by_parent = build_chunks_by_parent(list(chunks_by_id.values()))
     stage_latencies_ms["docstore_hydrate"] = int((time.perf_counter() - stage_started) * 1000)
