@@ -1080,6 +1080,9 @@ class QdrantVectorStoreTest(unittest.TestCase):
         )
         self.assertEqual(body["points"][0]["payload"]["doc_id"], "doc-1")
         self.assertEqual(body["points"][0]["payload"]["content_hash"], "hash-1")
+        self.assertNotIn("text", body["points"][0]["payload"])
+        self.assertNotIn("terms", body["points"][0]["payload"])
+        self.assertEqual(body["points"][0]["payload"]["parent_id"], chunk.parent_id)
 
     def test_search_uses_qdrant_query_points_and_returns_payload_chunks(self) -> None:
         chunk = make_chunk("chunk-1", "internal")
