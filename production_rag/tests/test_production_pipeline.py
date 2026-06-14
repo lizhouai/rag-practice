@@ -642,7 +642,7 @@ class RetrievalPipelineEnhancementTest(unittest.TestCase):
         chunks_by_id = {chunk.chunk_id: chunk for chunk in chunks}
         chunks_by_parent = rag.build_chunks_by_parent(chunks)
 
-        with patch.object(rag, "CONTEXT_TOKEN_BUDGET", 900):
+        with patch.object(rag, "CONTEXT_TOKEN_BUDGET", 899):
             selected, truncation = rag.dynamic_truncate(
                 candidates,
                 chunks_by_id,
@@ -657,11 +657,12 @@ class RetrievalPipelineEnhancementTest(unittest.TestCase):
             )
 
         selected_chunk_ids = [item.candidate.chunk_id for item in selected]
-        self.assertEqual(selected_chunk_ids, ["parent1-anchor", "parent2-anchor"])
+        self.assertEqual(selected_chunk_ids, ["parent1-anchor"])
         self.assertEqual(truncation["budget_basis"], "expanded_parent_context_tokens")
-        self.assertEqual(truncation["token_total"], 900)
+        self.assertEqual(truncation["context_token_budget"], 899)
+        self.assertEqual(truncation["token_total"], 450)
         self.assertEqual(context_packet["estimated_token_total"], truncation["token_total"])
-        self.assertLessEqual(context_packet["estimated_token_total"], 900)
+        self.assertLessEqual(context_packet["estimated_token_total"], 899)
         self.assertEqual(selected[0].expanded_from_chunk_ids, ["parent1-anchor", "parent1-sibling"])
 
     def test_external_reranker_can_replace_rule_score_ordering(self) -> None:
