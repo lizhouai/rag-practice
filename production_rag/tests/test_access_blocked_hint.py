@@ -11,7 +11,7 @@ from unittest.mock import patch
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-import run_pipeline as rag
+from tests.helpers import rag
 
 
 def _active_local_store_path(store_path: Path) -> Path:

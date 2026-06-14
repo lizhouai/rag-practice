@@ -2,77 +2,10 @@ from __future__ import annotations
 
 import argparse
 import csv
-import hashlib
-import json
-import math
-import os
-import re
-import sqlite3
-import time
-import urllib.error
-import urllib.parse
-import urllib.request
-import uuid
-from collections import Counter, defaultdict
-from concurrent.futures import ThreadPoolExecutor
-from contextlib import closing
-from dataclasses import asdict, dataclass, field
-from datetime import datetime
-from pathlib import Path
-from typing import Iterable
 
-from rag.config import *  # noqa: F401,F403 - re-export shim during modularization
-from rag.models import *  # noqa: F401,F403
-from rag.http import *  # noqa: F401,F403
-from rag.chunking import *  # noqa: F401,F403
-from rag.vectorstore.filters import *  # noqa: F401,F403
-from rag.vectorstore.sqlite import *  # noqa: F401,F403
-from rag.vectorstore.qdrant import *  # noqa: F401,F403
-from rag.vectorstore.mirrored import *  # noqa: F401,F403
-from rag.embedding import *  # noqa: F401,F403
-from rag.retrieval import *  # noqa: F401,F403
-from rag.rerank import *  # noqa: F401,F403
-from rag.selection import *  # noqa: F401,F403
-from rag.context import *  # noqa: F401,F403
-from rag.generation import *  # noqa: F401,F403
-from rag.access import *  # noqa: F401,F403
-from rag.indexing import *  # noqa: F401,F403
-from rag.monitoring import *  # noqa: F401,F403
-from rag.pipeline import run_query  # noqa: F401
-
-
-def build_corpus() -> tuple[list[ParentSection], list[Chunk]]:
-    parents: list[ParentSection] = []
-    chunks: list[Chunk] = []
-    for metadata, body in read_documents():
-        doc_parents = split_sections(metadata, body)
-        parents.extend(doc_parents)
-        for parent in doc_parents:
-            chunks.extend(chunk_parent(parent))
-    return parents, chunks
-
-
-def print_answer(trace: dict, trace_path: Path | None) -> None:
-    print(f"Query: {trace['query']}")
-    print(f"Trace id: {trace['trace_id']}")
-    if trace_path:
-        print(f"Trace file: {trace_path}")
-    if trace.get("trace_save_error"):
-        print(f"Trace save skipped: {trace['trace_save_error']}")
-    if trace.get("monitoring_write_error"):
-        print(f"Monitoring event write skipped: {trace['monitoring_write_error']}")
-    elif trace.get("monitoring_metrics_path"):
-        print(f"Monitoring event: {trace['monitoring_metrics_path']}")
-    print("\nSelected evidence:")
-    for evidence in trace["context_packet"]["evidence"]:
-        print(
-            f"- [{evidence['citation_id']}] {evidence['doc_id']} "
-            f"{' > '.join(evidence['title_path'])} score={evidence['rerank_score']}"
-        )
-    print("\nAnswer:")
-    print(trace["answer"]["answer"])
-    print("\nValidation:")
-    print(json.dumps(trace["validation"], ensure_ascii=False, indent=2))
+from rag.config import DEFAULT_VECTOR_BACKEND, EVAL_PATH, load_env
+from rag.chunking import split_metadata_values
+from rag.pipeline import run_query
 
 
 def run_eval(
