@@ -412,6 +412,21 @@ def run_query(
     stage_latencies_ms["mmr"] = int((time.perf_counter() - stage_started) * 1000)
 
     stage_started = time.perf_counter()
+    if resolved_vector_backend == "qdrant":
+        candidate_parent_ids = [
+            chunks_by_id[item.chunk_id].parent_id
+            for item in diversified
+            if item.chunk_id in chunks_by_id
+        ]
+        sibling_groups = SqliteDocstore(active_store_path).siblings(candidate_parent_ids)
+        if sibling_groups:
+            chunks_by_parent = {parent_id: siblings for parent_id, siblings in sibling_groups.items()}
+            for siblings in sibling_groups.values():
+                for sibling in siblings:
+                    chunks_by_id.setdefault(sibling.chunk_id, sibling)
+    stage_latencies_ms["docstore_siblings"] = int((time.perf_counter() - stage_started) * 1000)
+
+    stage_started = time.perf_counter()
     selected, truncation = dynamic_truncate(
         diversified,
         chunks_by_id,

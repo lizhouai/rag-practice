@@ -96,6 +96,85 @@ class PipelineHydrateTest(unittest.TestCase):
         self.assertIn("退款", json.dumps(trace["context_packet"], ensure_ascii=False))
         self.assertEqual(trace["component_status"]["vector_store"]["backend"], "qdrant")
 
+    def test_parent_expansion_pulls_unrecalled_sibling_from_docstore(self) -> None:
+        def fake_request_json(method, url, body=None, headers=None, ok_statuses=(200,)):
+            if method == "GET" and url.endswith("/collections/rag_test"):
+                return {
+                    "result": {
+                        "payload_schema": {name: {} for name in rag.QDRANT_PAYLOAD_INDEXES},
+                        "config": {"params": {"sparse_vectors": {rag.QDRANT_BM25_VECTOR_NAME: {}}}},
+                    }
+                }
+            if url.endswith("/points/query") and body.get("using") == rag.QDRANT_DENSE_VECTOR_NAME:
+                return {
+                    "result": {
+                        "points": [
+                            {
+                                "id": 1,
+                                "score": 0.9,
+                                "vector": {"dense": [1.0, 0.0]},
+                                "payload": {
+                                    "chunk_id": "c1",
+                                    "parent_id": "p1",
+                                    "doc_id": "d1",
+                                    "title_path": ["t"],
+                                    "token_count": 5,
+                                    "permission_scopes": ["internal"],
+                                },
+                            }
+                        ]
+                    }
+                }
+            if url.endswith("/points/query"):
+                return {"result": {"points": []}}
+            raise AssertionError(f"unexpected request {method} {url}")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store_path = Path(tmp) / "rag.sqlite"
+            active_store_path = _active_local_store_path(store_path)
+            rag.LocalVectorStore(active_store_path).upsert_document(
+                "d1",
+                "d.md",
+                "h",
+                "local:test",
+                [
+                    rag.Chunk(
+                        chunk_id="c1",
+                        parent_id="p1",
+                        doc_id="d1",
+                        title_path=["t"],
+                        text="第一段 已召回",
+                        metadata={"permission_scope": "internal"},
+                        token_count=5,
+                        dense_vector=[1.0, 0.0],
+                        terms=rag.tokenize("第一段"),
+                    ),
+                    rag.Chunk(
+                        chunk_id="c2",
+                        parent_id="p1",
+                        doc_id="d1",
+                        title_path=["t"],
+                        text="第二段 未召回兄弟",
+                        metadata={"permission_scope": "internal"},
+                        token_count=5,
+                        dense_vector=[0.0, 1.0],
+                        terms=rag.tokenize("第二段"),
+                    ),
+                ],
+            )
+            with (
+                patch.dict(os.environ, {"QDRANT_URL": "http://qdrant.test", "QDRANT_COLLECTION": "rag_test"}, clear=True),
+                patch.object(rag, "request_json", fake_request_json),
+            ):
+                trace = rag.run_query(
+                    "第一段",
+                    quiet=True,
+                    vector_backend="qdrant",
+                    store_path=store_path,
+                    metrics_path=Path(tmp) / "m.jsonl",
+                )
+        self.assertIn("第二段 未召回兄弟", json.dumps(trace["context_packet"], ensure_ascii=False))
+
 
 if __name__ == "__main__":
     unittest.main()
