@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,10 @@ class RerankerDependencyError(RuntimeError):
 
 class RerankerModelLoadError(RuntimeError):
     pass
+
+
+def is_tokenizer_compatibility_error(exc: AttributeError) -> bool:
+    return "prepare_for_model" in str(exc)
 
 
 def parse_bool(value: str, default: bool = False) -> bool:
@@ -196,30 +201,53 @@ class TransformersBackend:
         return [float(score) for score in scores]
 
 
+class AutoBackend:
+    def __init__(self, primary: Any, fallback_factory: Callable[[], Any]) -> None:
+        self.primary = primary
+        self.fallback_factory = fallback_factory
+        self.fallback: Any | None = None
+
+    def score(self, query: str, documents: list[str]) -> list[float]:
+        try:
+            return self.primary.score(query, documents)
+        except AttributeError as exc:
+            if not is_tokenizer_compatibility_error(exc):
+                raise
+            if self.fallback is None:
+                self.fallback = self.fallback_factory()
+            return self.fallback.score(query, documents)
+
+
 def load_backend(model_name: str, backend_name: str) -> Any:
-    if backend_name == "flagembedding":
-        return FlagEmbeddingBackend(
-            model_name,
-            use_fp16=parse_bool(os.getenv("RERANKER_USE_FP16", ""), default=False),
-        )
-    if backend_name == "transformers":
+    def make_transformers_backend() -> TransformersBackend:
         return TransformersBackend(
             model_name,
             max_length=int(os.getenv("RERANKER_MAX_LENGTH", "1024")),
         )
+
+    if backend_name == "flagembedding":
+        primary = FlagEmbeddingBackend(
+            model_name,
+            use_fp16=parse_bool(os.getenv("RERANKER_USE_FP16", ""), default=False),
+        )
+        return AutoBackend(primary, make_transformers_backend)
+    if backend_name == "transformers":
+        return make_transformers_backend()
     if backend_name != "auto":
         raise RuntimeError("RERANKER_BACKEND must be one of: auto, flagembedding, transformers.")
 
     try:
-        return FlagEmbeddingBackend(
+        primary = FlagEmbeddingBackend(
             model_name,
             use_fp16=parse_bool(os.getenv("RERANKER_USE_FP16", ""), default=False),
         )
+        return AutoBackend(primary, make_transformers_backend)
+    except AttributeError as exc:
+        if not is_tokenizer_compatibility_error(exc):
+            raise
+        return make_transformers_backend()
     except RerankerDependencyError:
-        return TransformersBackend(
-            model_name,
-            max_length=int(os.getenv("RERANKER_MAX_LENGTH", "1024")),
-        )
+        return make_transformers_backend()
 
 
 def create_app() -> Any:

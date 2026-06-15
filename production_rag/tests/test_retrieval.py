@@ -248,6 +248,57 @@ class RetrievalPipelineEnhancementTest(unittest.TestCase):
         self.assertEqual(response["results"][0]["id"], "second")
         self.assertEqual(response["results"][0]["index"], 1)
 
+    def test_bge_reranker_flagembedding_backend_falls_back_from_tokenizer_error(self) -> None:
+        service_path = PROJECT_ROOT / "scripts" / "serve_bge_reranker.py"
+        spec = importlib.util.spec_from_file_location("serve_bge_reranker", service_path)
+        self.assertIsNotNone(spec)
+        assert spec is not None and spec.loader is not None
+        service = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(service)
+
+        class BrokenFlagEmbeddingBackend:
+            def __init__(self, model_name: str, *, use_fp16: bool = False) -> None:
+                self.model_name = model_name
+                self.use_fp16 = use_fp16
+
+            def score(self, query: str, documents: list[str]) -> list[float]:
+                raise AttributeError("XLMRobertaTokenizer has no attribute prepare_for_model")
+
+        class FakeTransformersBackend:
+            def __init__(self, model_name: str, *, max_length: int = 1024) -> None:
+                self.model_name = model_name
+                self.max_length = max_length
+                self.calls: list[tuple[str, list[str]]] = []
+
+            def score(self, query: str, documents: list[str]) -> list[float]:
+                self.calls.append((query, documents))
+                return [0.35, 0.8]
+
+        with (
+            patch.object(service, "FlagEmbeddingBackend", BrokenFlagEmbeddingBackend),
+            patch.object(service, "TransformersBackend", FakeTransformersBackend),
+        ):
+            for backend_name in ("auto", "flagembedding"):
+                with self.subTest(backend_name=backend_name):
+                    backend = service.load_backend("D:/models/bge-reranker-v2-m3", backend_name)
+                    response = service.score_payload(
+                        {
+                            "model": "bge-reranker-v2-m3",
+                            "query": "SKU-A17 是否支持无理由退货？",
+                            "documents": [
+                                {"id": "first", "text": "generic refund text"},
+                                {"id": "second", "text": "exact SKU-A17 no reason return policy"},
+                            ],
+                        },
+                        backend=backend,
+                    )
+
+                    self.assertEqual(response["scores"], [0.35, 0.8])
+                    self.assertEqual(response["results"][0]["id"], "second")
+                    self.assertIsInstance(backend.fallback, FakeTransformersBackend)
+                    self.assertEqual(backend.fallback.calls[0][0], "SKU-A17 是否支持无理由退货？")
+                    self.assertEqual(backend.fallback.calls[0][1][1], "exact SKU-A17 no reason return policy")
+
     def test_bge_reranker_service_can_use_local_model_directory(self) -> None:
         service_path = PROJECT_ROOT / "scripts" / "serve_bge_reranker.py"
         spec = importlib.util.spec_from_file_location("serve_bge_reranker", service_path)
