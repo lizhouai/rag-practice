@@ -10,7 +10,6 @@ from rag.models import Candidate, Chunk, SelectedEvidence
 from rag.retrieval import cosine
 
 __all__ = [
-    "semantic_dedup",
     "mmr_select",
     "dynamic_truncate",
     "build_chunks_by_parent",
@@ -21,32 +20,6 @@ __all__ = [
 def _shim_value(name: str, default):
     shim = sys.modules.get("run_pipeline")
     return getattr(shim, name, default) if shim is not None else default
-
-
-def semantic_dedup(ranked: list[Candidate], chunks_by_id: dict[str, Chunk]) -> tuple[list[Candidate], list[dict]]:
-    dedup_threshold = _shim_value("DEDUP_THRESHOLD", DEDUP_THRESHOLD)
-    kept: list[Candidate] = []
-    dropped: list[dict] = []
-    for candidate in ranked:
-        chunk = chunks_by_id[candidate.chunk_id]
-        duplicate_of: tuple[Candidate, float] | None = None
-        for selected in kept:
-            selected_chunk = chunks_by_id[selected.chunk_id]
-            similarity = cosine(chunk.dense_vector, selected_chunk.dense_vector)
-            if similarity >= dedup_threshold:
-                duplicate_of = (selected, similarity)
-                break
-        if duplicate_of:
-            dropped.append(
-                {
-                    "chunk_id": candidate.chunk_id,
-                    "duplicate_of": duplicate_of[0].chunk_id,
-                    "similarity": round(duplicate_of[1], 4),
-                }
-            )
-        else:
-            kept.append(candidate)
-    return kept, dropped
 
 
 def mmr_select(

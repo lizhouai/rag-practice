@@ -6,7 +6,7 @@ import re
 from collections import Counter
 from pathlib import Path
 
-from rag.config import CHUNK_CHARS, OVERLAP_CHARS, QDRANT_SPARSE_HASH_BUCKETS, RAW_DIR, ROOT, STOPWORDS
+from rag.config import CHUNK_CHARS, OVERLAP_CHARS, QDRANT_SPARSE_HASH_BUCKETS, STOPWORDS
 from rag.config import resolve_vector_dimensions
 from rag.models import Chunk, ParentSection
 
@@ -128,20 +128,6 @@ def vectorize(tokens: list[str], dims: int | None = None) -> list[float]:
     if norm == 0:
         return vector
     return [value / norm for value in vector]
-
-
-def read_documents(raw_dir: Path = RAW_DIR) -> list[tuple[dict[str, str], str]]:
-    documents: list[tuple[dict[str, str], str]] = []
-    for path in sorted(raw_dir.glob("*.md")):
-        metadata, body = parse_frontmatter(path.read_text(encoding="utf-8"))
-        metadata.setdefault("doc_id", path.stem)
-        metadata.setdefault("title", path.stem)
-        metadata.setdefault("source_path", safe_relative(path, ROOT))
-        metadata.setdefault("permission_scope", "internal")
-        metadata.setdefault("effective_from", "")
-        metadata.setdefault("effective_to", "")
-        documents.append((metadata, normalize_text(body)))
-    return documents
 
 
 def split_sections(metadata: dict[str, str], body: str) -> list[ParentSection]:

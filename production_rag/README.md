@@ -272,7 +272,7 @@ python run_pipeline.py --query "SKU-A17 是否支持无理由退货？" --save-t
 
 ### 第一步：读取带 metadata 的文档
 
-`read_documents()` 会读取 `data/raw/` 下的 Markdown 文件，并解析 frontmatter。
+`sync_index()` 会遍历 `data/raw/` 下的 Markdown 文件，并解析 frontmatter。
 
 这些 metadata 不只是装饰字段。生产 RAG 里，文档从一开始就应该带上可检索、可过滤、可治理的信息，例如：
 
