@@ -6,7 +6,7 @@ from pathlib import Path
 from rag.chunking import build_document_chunks, content_hash, normalize_text, parse_frontmatter, safe_relative
 from rag.config import DEFAULT_EMBEDDING_DIMENSIONS, DEFAULT_EMBEDDING_MODEL, DEFAULT_RETRY_ATTEMPTS
 from rag.config import DEFAULT_VECTOR_DB_PATH, EMBEDDING_PROVIDER_EXTERNAL, EMBEDDING_PROVIDER_LOCAL
-from rag.config import LOCAL_EMBEDDING_MODEL, RAW_DIR, ROOT, embedding_identity, is_qdrant_configured
+from rag.config import LOCAL_EMBEDDING_MODEL, RAW_DIR, ROOT, embedding_identity, is_qdrant_cloud_url, is_qdrant_configured
 from rag.config import resolve_qdrant_api_key, resolve_qdrant_collection, resolve_qdrant_url, resolve_vector_dimensions
 from rag.http import RetryExhausted, call_with_retries
 from rag.vectorstore.mirrored import MirroredVectorStore
@@ -94,6 +94,19 @@ def initialize_vector_store_with_fallback(
                 "attempts": 0,
                 "qdrant_url": "",
                 "qdrant_collection": "",
+            }
+        )
+        return LocalVectorStore(store_path), "local"
+
+    if requested_backend == "qdrant" and is_qdrant_cloud_url() and not resolve_qdrant_api_key():
+        status.update(
+            {
+                "mode": "sqlite_fallback",
+                "backend": "local",
+                "fallback_used": True,
+                "reason": "not_configured",
+                "error": "Qdrant Cloud requires QDRANT_API_KEY or VECTOR_DB_API_KEY in addition to QDRANT_URL.",
+                "attempts": 0,
             }
         )
         return LocalVectorStore(store_path), "local"

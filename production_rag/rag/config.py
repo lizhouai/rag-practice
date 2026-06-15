@@ -159,6 +159,14 @@ def resolve_qdrant_api_key() -> str | None:
     return env_first("QDRANT_API_KEY", "VECTOR_DB_API_KEY")
 
 
+def is_qdrant_cloud_url(url: str | None = None) -> bool:
+    resolved_url = (url if url is not None else resolve_qdrant_url()).strip()
+    url_for_parse = resolved_url if "://" in resolved_url else f"https://{resolved_url}"
+    parsed = urllib.parse.urlparse(url_for_parse)
+    hostname = (parsed.hostname or "").lower()
+    return hostname.endswith(".cloud.qdrant.io")
+
+
 def resolve_qdrant_collection() -> str:
     return (
         env_first("QDRANT_COLLECTION", "VECTOR_DB_COLLECTION", default=DEFAULT_QDRANT_COLLECTION)

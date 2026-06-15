@@ -99,6 +99,38 @@ class DefaultFallbackBehaviorTest(unittest.TestCase):
         self.assertEqual(status["qdrant_url"], "")
         self.assertEqual(status["qdrant_collection"], "")
 
+    def test_qdrant_cloud_without_api_key_uses_actionable_configuration_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            store_path = tmp_path / "indexes" / "rag.sqlite"
+
+            with (
+                patch.dict(
+                    os.environ,
+                    {
+                        "QDRANT_URL": "https://cluster.us-east-1-1.aws.cloud.qdrant.io:6333",
+                        "QDRANT_COLLECTION": "rag_test",
+                    },
+                    clear=True,
+                ),
+                patch.object(rag, "request_json", side_effect=AssertionError("qdrant should not be probed")),
+            ):
+                status: dict = {}
+                vector_store, backend = rag.initialize_vector_store_with_fallback(
+                    "qdrant",
+                    store_path=store_path,
+                    status=status,
+                )
+
+        self.assertIsInstance(vector_store, rag.LocalVectorStore)
+        self.assertEqual(backend, "local")
+        self.assertEqual(status["mode"], "sqlite_fallback")
+        self.assertEqual(status["reason"], "not_configured")
+        self.assertEqual(status["attempts"], 0)
+        self.assertIn("QDRANT_API_KEY", status["error"])
+        self.assertEqual(status["qdrant_url"], "https://cluster.us-east-1-1.aws.cloud.qdrant.io:6333")
+        self.assertEqual(status["qdrant_collection"], "rag_test")
+
     def test_parse_args_rejects_removed_real_models_flag(self) -> None:
         with patch.object(
             sys,

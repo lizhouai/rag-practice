@@ -128,7 +128,7 @@ class QdrantVectorStore:
                     "Qdrant is not reachable. Set QDRANT_URL to a reachable Qdrant endpoint, "
                     "set QDRANT_API_KEY if the endpoint requires authentication, start the local "
                     "service with `docker compose up -d qdrant`, or use `--vector-backend local` "
-                    "only for offline debugging."
+                    f"only for offline debugging. Original error: {exc}"
                 ) from exc
         body = {
             "vectors": {
