@@ -1,42 +1,66 @@
 # Production RAG 工程化实操手册
 
-跑完 `mini_rag` 以后，你已经能看到一条最小 RAG 链路：读文档、切 chunk、做 embedding、召回、组装 Prompt、生成带引用的答案。
+`production_rag` 是 `mini_rag` 之后的工程化练习。它不试图一次做成完整平台，而是把一条 RAG 证据链拆成可运行、可观察、可排查、可评测的步骤：从带 metadata 的 Markdown 文档出发，经过权限过滤、混合检索、rerank、上下文组装、资料充足性判断、答案生成、引用校验，最后落到 trace 和 monitoring event。
 
-但只要把这条链路放进真实业务，新的问题会马上冒出来：文档怎么增量更新？权限受限资料会不会被召回？型号、编号、工单号这种短关键词靠向量能不能找准？Top-K 里混了重复证据怎么办？资料不足时系统能不能拒答？线上 bad case 发生后，能不能知道它坏在哪一步？
+跑完这个项目，你应该能回答这些更接近生产现场的问题：
 
-这份手册的目标，是把 `mini_rag` 的透明骨架升级成一条可观察、可排查、接近生产形态的 RAG 工程链路。它仍然不是完整线上系统，但它会把真实项目里绕不开的关键模块都跑给你看：
+- 文档变更后，索引什么时候更新、更新了什么、是否仍能复用旧 embedding？
+- 权限受限、未生效或已过期的资料，会不会在生成前被挡住？
+- 型号、编号、工单号这类短关键词，为什么不能只依赖向量召回？
+- Top-K 里混进重复证据、弱相关证据或相邻 chunk 时，怎么选出可用 context？
+- 资料不足、资料越权或问题超出知识库时，系统能不能拒答？
+- 线上 bad case 出现后，trace 能不能定位到召回、融合、重排、截断、生成或引用校验中的哪一步？
 
-- metadata 和权限过滤；
-- 增量索引同步；
-- parent section / child chunk；
-- Qdrant 向量数据库；
-- dense recall + BM25 双路召回；
-- RRF 融合；
-- rerank；
-- 语义去重；
-- 动态截断；
-- 资料充足性判断；
-- context packet；
-- 答案生成；
-- 引用校验；
-- trace 和 monitoring event。
+## 快速导航
+
+| 你想做什么 | 先看哪里 |
+| --- | --- |
+| 先把链路跑起来 | [1. 准备环境](#1-准备环境)、[2. 先跑一次完整工程链路](#2-先跑一次完整工程链路) |
+| 只想离线排障 | [5. 本地兜底模式](#5-本地兜底模式) |
+| 理解每一步为什么存在 | [4. 读懂代码里的 12 个环节](#4-读懂代码里的-12-个环节) |
+| 看坏 case 怎么定位 | [3. 只看 trace，不急着看答案](#3-只看-trace不急着看答案)、[10. 常见报错](#10-常见报错) |
+| 做最小回归评测 | [6. 做一次小型评测](#6-做一次小型评测) |
+| 扩展数据或接本地 reranker | [9. 扩充数据集](#9-扩充数据集)、[第九步：rerank](#第九步rerank) |
 
 ## 运行模式总览
 
-这个项目按用途分成两种模式：
+这个项目有两条常用运行路径：
 
-| 模式 | 推荐用途 | 命令形态 | 使用的模型与存储 |
+| 模式 | 什么时候用 | 命令形态 | 实际使用 |
 | --- | --- | --- | --- |
-| 真实模型模式 | 主学习路径，观察真实 embedding、真实生成模型和 Qdrant 如何协同 | `python run_pipeline.py --query "你的问题" --rebuild-index` | 真实 embedding provider + 真实 LLM + Qdrant |
-| 本地兜底模式 | 临时排障，验证非模型链路是否跑通 | `python run_pipeline.py --query "你的问题" --vector-backend local --rebuild-index` | 本地 hash embedding + 抽取式答案 + SQLite |
+| 真实模型模式 | 主学习路径；观察真实 embedding、真实生成模型和 Qdrant 如何协同 | `python run_pipeline.py --query "你的问题" --rebuild-index` | 智谱 `embedding-3` + DeepSeek V4 Pro + Qdrant |
+| 本地兜底模式 | API Key、网络或 Qdrant 不可用时排障；验证非模型链路 | `python run_pipeline.py --query "你的问题" --vector-backend local --rebuild-index` | 本地 hash embedding + 抽取式答案 + SQLite |
 
 推荐先跑真实模型模式。本地兜底模式只在 API Key、网络或 Qdrant 暂时不可用时使用，不用它评估真实召回质量、真实生成质量或最终用户体验。
 
-默认命令会自动探测已配置的真实组件；LLM、embedding、Qdrant 或 rerank 不可用时，会分别按组件降级，并把原因写入 trace。也就是说，向量库、embedding、生成模型和 reranker 不是一个总开关：哪一层配置好了就用哪一层，哪一层不可用就回到对应的可排障路径。
+默认命令会自动探测已配置组件。LLM、embedding、Qdrant 或 rerank 不可用时，系统会按组件单独降级，并把原因写入 trace。向量库、embedding、生成模型和 reranker 不是一个总开关：哪一层配置好了就用哪一层，哪一层不可用就回到对应的可排障路径。
 
 - `--vector-backend`：请求向量存储走 `qdrant` 还是 `local`；请求 `qdrant` 失败时会自动降级到 SQLite。
 
-配套代码在本目录下：
+## 5 分钟跑通路径
+
+下面的命令默认在 Git Bash 里执行。如果你已经有模型 API Key，并且本机可以启动 Docker，最短路径是：
+
+```bash
+cd ./production_rag
+python -m venv .venv
+source .venv/Scripts/activate
+python -m pip install --upgrade pip
+cp .env.example .env
+# 编辑 .env，填入 LLM_API_KEY、EMBEDDING_API_KEY 和 QDRANT_* 配置
+docker compose up -d qdrant
+python run_pipeline.py --query "跨境订单退款多久到账？" --rebuild-index
+```
+
+如果你只想先验证离线路径，不依赖模型服务和 Qdrant：
+
+```bash
+python run_pipeline.py --query "跨境订单退款多久到账？" --vector-backend local --rebuild-index
+```
+
+## 项目地图
+
+配套代码都在 `production_rag/` 下：
 
 - `run_pipeline.py`：薄 CLI 入口，只负责参数解析、加载 `.env`、运行单条查询或 eval。
 - `rag/`：生产风格 RAG 主链路包，按职责拆分检索、索引、上下文、生成和监控。
@@ -66,7 +90,7 @@
 | `context.py`、`generation.py` | context packet、资料充足性判断、答案生成和引用校验 |
 | `access.py`、`monitoring.py`、`pipeline.py` | 权限提示、监控事件和查询编排 |
 
-## 0. 先说做成什么样
+## 0. 项目边界与主链路
 
 先把边界说清楚。
 
@@ -115,7 +139,7 @@ run_pipeline.py CLI
 
 ## 1. 准备环境
 
-在 Windows Git Bash 里进入练习目录：
+进入练习目录：
 
 ```bash
 cd ./production_rag
@@ -129,7 +153,9 @@ source .venv/Scripts/activate
 python -m pip install --upgrade pip
 ```
 
-主链路代码只使用 Python 标准库，不需要额外安装运行依赖。主运行路径直接使用真实模型：
+主链路代码只使用 Python 标准库，不需要额外安装运行依赖。后续命令默认都在已激活的 Git Bash 虚拟环境里执行。
+
+主运行路径直接使用真实模型：
 
 - LLM：DeepSeek V4 Pro，Anthropic-compatible Messages API。
 - Embedding：智谱 `embedding-3`，OpenAI-compatible embeddings endpoint。
@@ -322,8 +348,6 @@ OVERLAP_CHARS = 60
 
 本地 SQLite 存储会按 embedding identity 派生独立文件名，避免真实 embedding 索引和 hash fallback 索引互相覆盖。
 
-这解决的是 `mini_rag` 里很容易遇到的问题：文档改了，但索引更新节奏没有被显式管理。
-
 生产系统里，索引不是临时缓存，而是系统状态。你要知道：
 
 - 哪些文档变了；
@@ -405,7 +429,7 @@ python run_pipeline.py --query "跨境退款一般几天能回到卡里？" --tr
 
 ### 第七步：BM25 recall
 
-Qdrant 模式下，关键词召回走 Qdrant 的 `bm25` sparse vector，并在 Qdrant 查询里同时应用权限和生效期 filter。只有 `--vector-backend local` 时才使用 SQLite FTS5 的 `bm25()`。`bm25_recall()` 仍保留为纯函数对照。
+Qdrant 模式下，关键词召回走 Qdrant 的 `bm25` sparse vector，并在 Qdrant 查询里同时应用权限和生效期 filter。只有 `--vector-backend local` 时才使用 SQLite FTS5 的 `bm25()`。`bm25_recall()` 是本地简易实现，作为纯函数对照。
 
 它对这类问题尤其有用：
 
@@ -438,7 +462,7 @@ rrf_top
 
 如果没有配置 rerank 模型，流程会跳过模型 rerank，直接把 RRF 融合后的候选交给后续 MMR 和动态截断。此时 RRF 只被当作同一 query 内的排序信号，不被当作相关性置信分。trace 中会记录 `reranker.mode=skipped`、`reranker.reason=not_configured`、`reranker.score_policy=rrf_only`，便于区分“没有模型重排”和“模型重排成功”。
 
-有条件时，也可以接一个本地 CPU reranker 服务。这个项目推荐用 `FlagEmbedding` 或 `Transformers` 把 `BAAI/bge-reranker-v2-m3` 包成 HTTP 服务，而不是假设 Ollama 原生支持 rerank endpoint。
+有条件时，也可以接一个本地 CPU reranker 服务。这个项目使用 `FlagEmbedding` 或 `Transformers` 把 `BAAI/bge-reranker-v2-m3` 包成 HTTP 服务。
 
 先安装可选依赖：
 
@@ -493,7 +517,7 @@ RERANKER_MODEL=bge-reranker-v2-m3
 RERANKER_TIMEOUT_SECONDS=30
 ```
 
-如果已配置的 rerank 服务不可用，production_rag 不会回退到规则 rerank；它会跳过模型 rerank，继续使用 RRF 融合顺序，并在 trace 的 `reranker.mode=skipped`、`reranker.reason=reranker_error`、`reranker.score_policy=rrf_only` 和 `reranker.error` 里记录原因。这样练习不会因为本地 reranker 没启动就中断，也不会混用不同打分体系。
+如果已配置的 rerank 服务不可用，production_rag 会跳过模型 rerank，继续使用 RRF 融合顺序，并在 trace 的 `reranker.mode=skipped`、`reranker.reason=reranker_error`、`reranker.score_policy=rrf_only` 和 `reranker.error` 里记录原因。这样练习不会因为本地 reranker 没启动就中断，也不会混用不同打分体系。
 
 真实生产里，这一层通常会替换成专门的 rerank 模型，但它解决的问题不变：召回阶段先多拿候选，rerank 阶段再更细地判断证据相关性。
 
@@ -510,8 +534,8 @@ RERANKER_TIMEOUT_SECONDS=30
 
 `dynamic_truncate()` 会根据几个因素决定最终证据包：
 
-- 最低 rerank 分数；未配置 rerank 模型时不使用绝对分数门槛；
-- 分数断崖；未配置 rerank 模型时不使用 RRF gap 做断崖截断；
+- 最低 rerank 分数，未配置 rerank 模型时不使用绝对分数门槛；
+- 分数断崖，未配置 rerank 模型时不使用 RRF gap 做断崖截断；
 - 最大证据条数；
 - context token 预算。
 
@@ -625,60 +649,20 @@ python run_pipeline.py --query "今天北京天气怎么样？" --trace-only
 python -m unittest discover -s tests
 ```
 
-## 7. 三个必须亲手试的实验
+## 7. 两个必须亲手试的实验
 
-### 实验一：改文档，手动重建索引
-
-修改 `data/raw/refund_policy.md` 里的退款时效描述。
-
-然后运行一次不带 `--rebuild-index` 的查询：
-
-```bash
-python run_pipeline.py --query "跨境订单退款多久到账？" --trace-only
-```
-
-此时默认只读取既有索引，`index_sync.changed_docs` 应该为空，答案仍来自上一次构建好的索引。
-
-再显式重建：
-
-```bash
-python run_pipeline.py --query "跨境订单退款多久到账？" --rebuild-index --trace-only
-```
-
-这次 `changed_docs` 会记录被重新写入索引的文档。
-
-这个实验能帮你建立一个重要直觉：生产 RAG 的知识更新不是“查询时发现文档变化就立即 rebuild”，而是由明确的索引构建任务控制节奏。
-
-### 实验二：比较 dense 和 BM25 的分工
-
-先问一个偏语义表达的问题：
-
-```bash
-python run_pipeline.py --query "跨境退款一般几天能回到卡里？" --trace-only
-```
-
-再问一个偏精确标识的问题：
-
-```bash
-python run_pipeline.py --query "SKU-A17 是否支持无理由退货？" --trace-only
-```
-
-对比 `dense_top` 和 `bm25_top`。你会看到两条召回路径的强项不一样。
-
-这就是为什么生产 RAG 常用混合检索：向量负责语义，BM25 负责精确词，RRF 负责把两边证据合到一个候选池里。
-
-### 实验三：验证权限拒答
+### 实验一：验证权限拒答
 
 默认权限下问财务受限问题：
 
 ```bash
-python run_pipeline.py --query "FR-21 差异工单怎么处理？" --trace-only
+python run_pipeline.py --query "FR-21 差异工单怎么处理？" --trace-only --blocked-hint
 ```
 
 再带财务权限：
 
 ```bash
-python run_pipeline.py --query "FR-21 差异工单怎么处理？" --scopes finance_restricted --trace-only
+python run_pipeline.py --query "FR-21 差异工单怎么处理？" --scopes finance_restricted --trace-only --blocked-hint
 ```
 
 观察 `permission_filter.rejected_chunks`、`permission_filter.blocked_matches` 和 `context_packet.sufficiency.reason`。
@@ -696,13 +680,13 @@ python run_pipeline.py --query "SKU-A17 是否支持无理由退货？"
 默认路径类似：
 
 ```text
-C:\Users\<you>\AppData\Local\Temp\production_rag_runtime\traces\online_metrics.jsonl
+C:/Users/<you>/AppData/Local/Temp/production_rag_runtime/traces/online_metrics.jsonl
 ```
 
 也可以用环境变量覆盖运行目录：
 
-```text
-RAG_RUNTIME_DIR=C:\tmp\production_rag_runtime
+```bash
+RAG_RUNTIME_DIR=C:/tmp/production_rag_runtime python run_pipeline.py --query "SKU-A17 是否支持无理由退货？"
 ```
 
 monitoring event 会记录：
@@ -749,7 +733,7 @@ python run_pipeline.py --query "SKU-A17 是否支持无理由退货？" --no-mon
 如果要额外导入英文开源客服数据行，可以使用 MIT 许可的 Hugging Face 数据集 `rjac/e-commerce-customer-support-qa`：
 
 ```bash
-pip install -r requirements-dataset.txt
+python -m pip install -r requirements-dataset.txt
 python scripts/import_customer_support_dataset.py --limit 120 --rows-per-doc 12
 ```
 
