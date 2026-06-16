@@ -626,6 +626,29 @@ python run_pipeline.py --eval --rebuild-index
 - 商品召回通知核对；
 - 平台商家售后边界。
 
+当前 `--eval` 是轻量 golden 回归，不是语义评测器。每条用例会先运行一次
+`run_query()`，然后按下面的规则判断 `PASS / FAIL`：
+
+- `must_answer=true`：必须同时满足两个条件。
+  - `expected_doc_id` 为空，或出现在本次选中的 evidence `doc_id` 里；
+  - `expected_terms` 是最终答案文本里的精确子串，也就是
+    `expected_terms in answer_text`。
+- `must_answer=false`：只要求答案模式是 `refusal`，用于检查资料外问题是否拒答。
+
+因此，`expected_terms` 当前就是字符串包含判断。它不会做语义等价、同义词扩展、
+大小写归一化、数字 / 日期归一化或 LLM judge。这个设计适合做便宜、稳定、可解释的
+回归门禁，帮助快速发现检索、引用或拒答链路是否明显坏掉；不要把它当成真实线上回答质量
+的最终分数。
+
+更接近工业实践的评测通常会拆成几层看：
+
+- 检索层：看期望 `doc_id` / `chunk_id` 是否进入 top-k，统计 `hit@k`、`recall@k`、
+  `MRR`、`nDCG`，同时检查权限过滤和过期文档过滤；
+- 答案层：简单事实用包含、正则、枚举值、数值范围、日期归一化等规则检查；
+  复杂问答再引入带 rubric 的 LLM-as-judge 或人工抽检；
+- 忠实性层：检查答案里的关键断言是否能被引用 evidence 支持；
+- 拒答层：把资料外、权限受限、低置信度问题单独评估，避免和普通问答混成一个分数。
+
 也可以逐条手工看 trace：
 
 ```bash
@@ -643,13 +666,7 @@ python run_pipeline.py --query "今天北京天气怎么样？" --trace-only
 
 生产 RAG 评测要拆链路看。最终答案只是结果，trace 才是诊断。
 
-如果改了代码或 README 里的行为描述，建议同时跑一次回归测试，确认文档和实现没有脱节：
-
-```bash
-python -m unittest discover -s tests
-```
-
-## 7. 必须亲手试的实验
+## 7. 建议亲手试的实验
 
 ### 验证权限拒答
 
