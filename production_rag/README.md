@@ -68,7 +68,7 @@ python run_pipeline.py --query "跨境订单退款多久到账？" --vector-back
 - `eval_cases.csv`：小型 golden set。
 - `docker-compose.yml`：本地 Qdrant 启动配置。
 - `.env.example`：DeepSeek / 智谱 / Qdrant 配置示例。
-- `docs/`：模块化设计说明和执行计划留档，帮助理解当前拆分边界。
+- 本地 `docs/` 留档（若存在，不随仓库发布）：模块化设计说明和执行计划，帮助理解拆分边界。
 - `requirements-reranker.txt`：可选本地 reranker 服务依赖。
 - `scripts/serve_bge_reranker.py`：`bge-reranker-v2-m3` 的 FlagEmbedding / Transformers HTTP 服务。
 - `scripts/import_customer_support_dataset.py`：可选数据集导入脚本。
