@@ -649,9 +649,9 @@ python run_pipeline.py --query "今天北京天气怎么样？" --trace-only
 python -m unittest discover -s tests
 ```
 
-## 7. 两个必须亲手试的实验
+## 7. 必须亲手试的实验
 
-### 实验一：验证权限拒答
+### 验证权限拒答
 
 默认权限下问财务受限问题：
 
